@@ -1,35 +1,26 @@
-"""riv_theta_to_physical_verify_check.py -- verifies that the dotted
-"true theta" lines in the theta_epochs plots really do correspond exactly
-to cfg.k_true/tau1_true/tau2_true, two ways:
+"""Verify that the dotted "true theta" lines in the theta_epochs plots match
+cfg.k_true/tau1_true/tau2_true, two ways:
 
-1. Exact round-trip check (no simulation, no noise): for every fs already
-   used in both sweeps, params_to_theta(k_true,tau1_true,tau2_true,Ts) is
-   fed straight back through theta_to_params (its documented analytic
-   inverse, riv_dual_estimation.py:178-193) and compared to the original
-   (k_true,tau1_true,tau2_true). This isolates the discretization math
-   itself from any estimator/noise behavior.
+1. Round trip (no simulation, no noise): for every fs used in both sweeps,
+   params_to_theta(k_true, tau1_true, tau2_true, Ts) is fed through
+   theta_to_params (its analytic inverse) and compared to the original,
+   isolating the discretization math from estimator behavior.
 
-2. Physical-parameter trajectory plots: same theta_hat_by_epoch data
-   already computed for the epoch-grid figures, but converted from
-   theta-space (a1,a2,b1,b2) to physical space (k,tau1,tau2) via a
-   vectorized re-implementation of theta_to_params's exact formula
-   (np.roots-based per-sample calls would be needlessly slow over 80000
-   samples x 5 epochs; the closed-form quadratic used here is the same
-   z^2-a1*z-a2=0 root formula, just elementwise -- not a different
-   method), with NaN where the instantaneous theta doesn't correspond to
-   two real stable poles (common during the wild early-transient spikes
-   already visible in the theta-space plots). Dashed lines are
-   cfg.k_true/tau1_true/tau2_true directly -- not round-tripped through
-   theta_true at all, so this also independently exercises the Config
-   constants themselves.
+2. Physical-parameter trajectories: the theta_hat_by_epoch data from the epoch
+   grids, converted from (a1,a2,b1,b2) to (k,tau1,tau2) with a vectorized
+   theta_to_params (the same z^2-a1*z-a2=0 root formula applied elementwise,
+   since per-sample np.roots over 80000 samples x 5 epochs would be slow).
+   NaN where theta is not two real stable poles (common in the early
+   transient). Dashed lines are cfg.k_true/tau1_true/tau2_true directly, so
+   this also exercises the Config constants.
 
-Run: python3 scripts/riv_theta_to_physical_verify_check.py
+Run: python3 scripts/experiments/real_data_checks/riv_theta_to_physical_verify_check.py
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))  # repo root, for riv_* module imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))  # repo root
 
 import numpy as np
 import matplotlib
@@ -65,9 +56,8 @@ def roundtrip_check(fs_values: list[float], label: str) -> None:
 
 
 def theta_traj_to_physical(theta_traj: np.ndarray, Ts: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Vectorized theta_to_params (riv_dual_estimation.py:178-193): same
-    closed-form root of z^2-a1*z-a2=0, applied elementwise instead of via
-    np.roots per sample. NaN where poles aren't two real values in (0,1)."""
+    """Vectorized theta_to_params: the closed-form root of z^2-a1*z-a2=0 applied
+    elementwise. NaN where poles are not two real values in (0,1)."""
     a1, a2, b1, b2 = theta_traj[:, 0], theta_traj[:, 1], theta_traj[:, 2], theta_traj[:, 3]
     disc = a1 ** 2 + 4 * a2
     valid = disc >= 0
@@ -85,11 +75,10 @@ def theta_traj_to_physical(theta_traj: np.ndarray, Ts: float) -> tuple[np.ndarra
     return k, tau1, tau2
 
 
-def plot_physical_epochs(runs_epoch0, run_final_ref: dict, label: str, fs: float, path: Path) -> None:
-    """One figure, one subplot per selected epoch, k_hat on the left axis
-    (dashed=k_true), tau1_hat/tau2_hat on the right axis (dashed=tau_true)
-    -- mirrors plot_theta_epochs_stacked's per-epoch layout, just in
-    physical-parameter space instead of theta space."""
+def plot_physical_epochs(run_final_ref: dict, label: str, fs: float, path: Path) -> None:
+    """One subplot per selected epoch: k_hat on the left axis (dashed=k_true),
+    tau1_hat/tau2_hat on the right (dashed=tau_true). Like
+    plot_theta_epochs_stacked, in physical rather than theta space."""
     epochs = run_final_ref["selected_epochs"]
     t = run_final_ref["t"]
     cfg = Config()
@@ -125,9 +114,9 @@ def main() -> None:
 
     fs = 50.0
     r3 = collect_3tone(fs)
-    plot_physical_epochs(None, r3, "3-tone signal", fs, OUT_DIR / "physical_epochs_3tone_fs50.png")
+    plot_physical_epochs(r3, "3-tone signal", fs, OUT_DIR / "physical_epochs_3tone_fs50.png")
     rr = collect_real(fs)
-    plot_physical_epochs(None, rr, "real-recon weighted-multisine", fs,
+    plot_physical_epochs(rr, "real-recon weighted-multisine", fs,
                           OUT_DIR / "physical_epochs_realrecon_fs50.png")
     print(f"\nsaved: {OUT_DIR / 'physical_epochs_3tone_fs50.png'}")
     print(f"saved: {OUT_DIR / 'physical_epochs_realrecon_fs50.png'}")

@@ -1,20 +1,15 @@
-"""
-Systematic V1 (dual KF+RIV) pipeline health diagnostics.
+"""V1 (dual KF+RIV) pipeline health diagnostics on the real system_id recordings.
 
-Three sweeps, all against the real system_id recordings:
-  1. AR disturbance-model order -- is [seg_ar_order_min, seg_ar_order_max]=[3,10]
-     (the range fit_ar_beta_model_per_recording actually searches) the right
-     range, or does AIC/whiteness keep improving outside it?
+  1. AR disturbance-model order: whether [seg_ar_order_min, seg_ar_order_max]
+     = [3, 10] is the right search range, or AIC/whiteness keep improving
+     outside it.
   2. KF/RIV tuning knobs (lambda_ff, p0_kf_state_var, p0_rls, q_off_frac,
-     gamma_pole, n_epochs) -- one-at-a-time sensitivity sweep around the
-     current DualConfig defaults, tracking k/tau1/tau2 plus the NIS and
-     innovation-whiteness diagnostics added for KF-convergence checking.
-  3. RIV instrument choice -- current auxiliary-model instrument vs the
-     classic lagged-u instrument, compared on the same metrics via the dense
-     (non-jitted) reference estimator so the validated production core is
-     untouched.
+     gamma_pole, n_epochs): one-at-a-time sensitivity around the DualConfig
+     defaults, tracking k/tau1/tau2 plus NIS and innovation whiteness.
+  3. RIV instrument: auxiliary-model vs lagged-u, compared on the same
+     metrics through the dense reference estimator.
 
-Writes plots to riv_v1_diagnostics_output/, prints a text summary.
+Writes plots to riv_v1_diagnostics_output/ and prints a text summary.
 """
 from __future__ import annotations
 import contextlib
@@ -39,9 +34,7 @@ def _quiet(fn, *a, **kw):
         return fn(*a, **kw)
 
 
-# ==========================================================================
-# 1. AR order sweep
-# ==========================================================================
+# AR order sweep
 
 def sweep_ar_order(recordings: dict, cfg: R.Config, order_range=range(1, 16)) -> dict:
     all_outputs = np.concatenate([y for _, y in recordings.values()])
@@ -106,9 +99,7 @@ def plot_ar_order_sweep(results: dict, cfg: R.Config, path: Path) -> None:
     plt.close(fig)
 
 
-# ==========================================================================
-# 2. KF/RIV parameter sweeps
-# ==========================================================================
+# KF/RIV parameter sweeps
 
 SWEEP_GRIDS = {
     "lambda_ff": [0.99, 0.995, 0.999, 0.9995, 0.9999, 0.99995, 0.99999],
@@ -147,9 +138,7 @@ def plot_kf_param_sweep(param: str, values: list, metrics: dict, default_value, 
     plotted = ["k", "tau1", "tau2", "nis_mean", "whiteness_frac", "prls_a1a2_cond"]
     fig, axes = plt.subplots(2, 3, figsize=(16, 8))
     xscale = "log" if param in LOG_SCALE_PARAMS and min(values) > 0 else "linear"
-    # lambda_ff values all cluster near 1 -- plot 1-lambda on a log axis
-    # (the natural "forgetting horizon ~ 1/(1-lambda)" scale) instead of
-    # lambda itself, which crams every point into the top decade.
+    # lambda_ff clusters near 1, so plot 1-lambda on a log axis
     if param == "lambda_ff":
         x = [1.0 - v for v in values]
         default_x = 1.0 - default_value
@@ -178,9 +167,7 @@ def plot_kf_param_sweep(param: str, values: list, metrics: dict, default_value, 
     plt.close(fig)
 
 
-# ==========================================================================
-# 3. RIV instrument comparison (dense reference, production core untouched)
-# ==========================================================================
+# RIV instrument comparison (dense reference)
 
 def run_dense_epochs(u_norm, y, phi_c, Q_c, R_this, x0, P0_kf, theta0, P0_rls,
                       dual_cfg: R.DualConfig, n_eta, p, n_off, a1_prior, a2_prior,
@@ -193,7 +180,7 @@ def run_dense_epochs(u_norm, y, phi_c, Q_c, R_this, x0, P0_kf, theta0, P0_rls,
             dual_cfg.lambda_ff, n_eta, p, n_off=n_off, gamma_pole=dual_cfg.gamma_pole,
             a1_prior=a1_prior, a2_prior=a2_prior, instrument=instrument)
         theta_cur = out[1][-1].copy()
-    return out  # x_hat, theta_hat, y_hat, Pkf_final, Prls_final, innov_hist, S_hist
+    return out
 
 
 def compare_instruments(recordings: dict, ar_fits: dict, cfg: R.Config,
@@ -241,9 +228,7 @@ def plot_instrument_comparison(results: dict, path: Path) -> None:
     plt.close(fig)
 
 
-# ==========================================================================
 # main
-# ==========================================================================
 
 def main() -> None:
     FIG_DIR.mkdir(parents=True, exist_ok=True)

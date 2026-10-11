@@ -1,21 +1,11 @@
-"""riv_sampling_rate_pole_diagnostic.py -- Entry 53's next step: do the
-identified discrete-pole locations explain the two-sided fs failure
+"""Do the identified discrete-pole locations explain the two-sided fs failure
 (collapse below fs~6Hz, degradation above fs~75Hz)?
 
-For each fs, computes the TRUE discrete pole magnitudes (mechanical
-consequence of ZOH discretization: exp(-Ts/tau) -- these move toward z=1
-as fs rises and toward z=0 as fs falls, independent of any estimation
-error) alongside the IDENTIFIED poles' magnitude at the end of estimation
-(median/max over seeds, from theta_hat[-1] via the same
-z^2-a1*z-a2=0 characteristic equation `theta_to_params` uses). This arm
-(instrument_mode=AUX_DECIMATED, M=1, from
-riv_instrument_update_rate_experiment.py) has NO pole clamp (Entry 47's
-faithful old-prototype replication), so identified poles are free to
-drift wherever the RLS update takes them -- their raw trajectory is the
-direct evidence for or against the "poles approach the z=1/z=0 boundary"
-hypothesis, not masked by a clamp.
-
-Run: python3 scripts/riv_sampling_rate_pole_diagnostic.py
+For each fs this computes the true discrete pole magnitudes exp(-Ts/tau)
+(which move toward z=1 as fs rises and toward z=0 as it falls, independent of
+estimation error) next to the identified poles' magnitude at the end of
+estimation (median/max over seeds, from theta_hat[-1] via the same
+z^2-a1*z-a2=0 equation as `theta_to_params`).
 """
 from __future__ import annotations
 
@@ -25,7 +15,7 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "experiments/instrument_update_rate"))
 import riv_instrument_update_rate_experiment as rate_mod
-from riv_sampling_rate_sweep_experiment import BASE_CFG, ADAPTIVE_ARM, cfg_at_fs
+from riv_sampling_rate_sweep_experiment import ADAPTIVE_ARM, cfg_at_fs
 
 N_SEEDS = 10
 FS_VALUES = [3.0, 4.0, 4.743, 5.612, 6.641, 9.297, 13.015, 18.222, 25.510,

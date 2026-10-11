@@ -1,77 +1,9 @@
-"""riv_real_recon_multisine_sweep_check.py -- repeats the fs sweep (Entry 50 /
-riv_sampling_rate_sweep_experiment.py: fs=50Hz "adaptive" arm baseline,
-coarse geometric descent + bisection to find the failure boundary) with the
-input excitation replaced by a multisine RECONSTRUCTED from the real
-recorded data in real_recordings/delay_5/system_id_long_run.csv (the
-longest of the real recordings, N=6120 samples at the recordings'
-native Ts=0.04s / fs=25Hz).
 
-Reconstruction method: Hann-windowed FFT of the (mean-removed) real u,
-DC/leakage bins below 3 frequency-resolution-bins dropped, top-10 local
-power maxima kept as the reconstructed tone set, EACH TONE WEIGHTED BY
-sqrt(its power) (normalized to the fundamental) -- i.e. amplitude-matched
-to the real signal's own spectrum, not equal-amplitude. This is a clean
-harmonic series (confirmed by direct inspection): fundamental ~0.249Hz,
-harmonics spaced ~0.249-0.253Hz apart out to the 10th at 2.5Hz -- i.e. the
-real system-id stimulation is itself a ~4.01s-period repeating sequence
-(~100 samples/period at 25Hz), not noise-like, so a small number of
-harmonic lines captures effectively all of its structure, and that
-structure is heavily fundamental-dominated (2nd harmonic ~27% of the
-fundamental's amplitude, everything past the 6th harmonic under ~10%).
-An earlier equal-amplitude version of this script (all 10 tones same
-amplitude, see riv_wide_multisine_fs50_check.py's convention) was found to
-fail much earlier (fs~9.7Hz) than the current 3-tone signal's ~5.6-6.1Hz
-boundary -- this weighted version tests whether that was an artifact of
-forcing equal power into harmonics the real signal barely uses. Tone
-frequencies as a fraction of the recording's own Nyquist (12.5Hz) span
-~0.02-0.20 -- much narrower than the "tutor's" wide multisine (0.008-0.8)
-used in riv_wide_multisine_fs50_check.py, since the real stimulation is
-comparatively low-bandwidth.
-
-Same frequency-scaling convention as riv_wide_multisine_fs50_check.py:
-preserve the extracted tones' fractions of Nyquist, re-anchor to whatever
-fs is in play in the sweep (so it doesn't alias as fs drops), rather than
-holding the extracted Hz values fixed at their 25Hz-native values.
-
-Amplitude: make_weighted_multisine rescales the weighted sum to [lo,hi]
-with lo=0, hi=cfg.u_max -- the current 2-pole synthetic scenario's own
-envelope, NOT the real recording's tiny native amplitude (~0.004-0.026,
-~100x smaller, tuned for an unrelated single-pole patient model) -- only the frequency
-CONTENT is borrowed from the real data, the known-truth 2-pole plant
-(k_true=62.11, tau1_true=0.05, tau2_true=0.25) and its own amplitude scale
-are unchanged, exactly as in riv_wide_multisine_fs50_check.py.
-
-Reused, unmodified (no source file below is edited in place): Config,
-AUX_DECIMATED, perturb_true_params, run_dual_estimator_instrument (from
-riv_instrument_update_rate_experiment.py), synthesize_ar_beta_fallback,
-simulate_ar_beta (riv_single_pole_50hz_replication_check.py), make_multisine
-(riv_excitation_protocol_design_check.py), theta/state-space/AR helpers
-(riv_dual_estimation.py). make_scenario_real_recon below is a byte-for-byte
-duplicate of riv_instrument_update_rate_experiment.make_scenario (lines
-427-456) with only the input-generation line swapped (marked inline), and
-eval_fs_real/coarse_descent_real/bisect_boundary_real duplicate
-riv_sampling_rate_sweep_experiment.py's eval_fs/coarse_descent/
-bisect_boundary (lines 68-121) with sweep_arm's per-seed body swapped to
-call make_scenario_real_recon -- same algorithm/constants (COARSE_RATIO=
-1/1.4, OK_RATE_THRESHOLD=0.5, ANCHOR_OK_RATE_MIN=0.8, BISECT_TOL_FRAC=0.10,
-N_SEEDS=10) for direct comparability with Entry 50's documented ~5.6-6.1Hz
-boundary.
-
-CAVEAT (same as riv_wide_multisine_fs50_check.py, see its docstring): the
-reused make_multisine draws one rng.uniform() phase per tone (10 scalar
-draws) vs. the original make_multisine_input's single vectorized 3-draw
-call, shifting the rng stream for every draw after the swap point within
-make_scenario for a given seed -- so noise/disturbance realizations differ
-from the original-signal runs even at "the same seed", not just u. Valid
-for a median/ok-rate comparison, not a seed-by-seed diff.
-
-Run: python3 scripts/riv_real_recon_multisine_sweep_check.py
-"""
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))  # repo root, for riv_* module imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))  # repo root
 
 import numpy as np
 import matplotlib
@@ -95,22 +27,12 @@ from riv_instrument_update_rate_experiment import (
 )
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 REAL_CSV = REPO_ROOT / "real_recordings" / "delay_5" / "system_id_long_run.csv"
-REAL_TS = 0.04  # native Ts of the real-recordings dataset (riv_dual_estimation.py Config.Ts)
+REAL_TS = 0.04  # native Ts of the real recordings (Config.Ts)
 N_TONES = 10
 
 
 def extract_dominant_freqs_hz(csv_path: Path, Ts_real: float,
                                n_tones: int = N_TONES) -> tuple[np.ndarray, np.ndarray]:
-    """Hann-windowed FFT of the real recorded input u, top-n_tones local
-    power maxima (DC/leakage bins below 3 frequency bins excluded).
-    Returns (freqs_hz, weights) where weights = sqrt(power) at each peak,
-    normalized so the largest = 1 -- i.e. each tone's amplitude relative
-    to the fundamental, matching the real signal's actual power
-    distribution (heavily fundamental-dominated: ratio ~14:1 in power,
-    ~3.7:1 in amplitude, over the 2nd harmonic, and >1000:1 in power over
-    the smallest harmonics -- confirmed by direct inspection of this
-    recording). Deterministic -- no rng involved, computed once at import
-    time."""
     u = np.genfromtxt(csv_path, delimiter=",", skip_header=1, usecols=0)
     n = len(u)
     u_detrended = u - u.mean()
@@ -118,7 +40,7 @@ def extract_dominant_freqs_hz(csv_path: Path, Ts_real: float,
     freqs = np.fft.rfftfreq(n, d=Ts_real)
     power = np.abs(spectrum) ** 2
     df = 1.0 / (n * Ts_real)
-    power[freqs < 3 * df] = 0.0  # drop DC + near-DC leakage
+    power[freqs < 3 * df] = 0.0
 
     maxima = [i for i in range(1, len(power) - 1) if power[i] > power[i - 1] and power[i] > power[i + 1]]
     maxima.sort(key=lambda i: -power[i])
@@ -130,7 +52,7 @@ def extract_dominant_freqs_hz(csv_path: Path, Ts_real: float,
 
 _EXTRACTED_FREQS_HZ, _TONE_WEIGHTS = extract_dominant_freqs_hz(REAL_CSV, REAL_TS)
 _REAL_NYQUIST_HZ = 1.0 / (2 * REAL_TS)
-_REL_FREQS = _EXTRACTED_FREQS_HZ / _REAL_NYQUIST_HZ  # fractions of the recording's own Nyquist
+_REL_FREQS = _EXTRACTED_FREQS_HZ / _REAL_NYQUIST_HZ
 
 
 def real_recon_freqs_hz(fs: float) -> np.ndarray:
@@ -141,10 +63,8 @@ def real_recon_freqs_hz(fs: float) -> np.ndarray:
 
 def make_weighted_multisine(n: int, lo: float, hi: float, Ts: float, freqs_hz: np.ndarray,
                              weights: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Same construction as riv_excitation_protocol_design_check.make_multisine
-    (sum of sinusoids, random phase, rescaled to [lo,hi]) but with a
-    per-tone amplitude weight, so the reconstructed signal's relative tone
-    power matches the real recording's instead of being equal-amplitude."""
+    """riv_excitation_protocol_design_check.make_multisine with a per-tone
+    amplitude weight, so relative tone power matches the real recording."""
     t = np.arange(n) * Ts
     x = np.zeros(n)
     for f, w in zip(freqs_hz, weights):
@@ -154,8 +74,7 @@ def make_weighted_multisine(n: int, lo: float, hi: float, Ts: float, freqs_hz: n
 
 
 def make_scenario_real_recon(cfg: Config, rng: np.random.Generator) -> dict:
-    """Duplicate of riv_instrument_update_rate_experiment.make_scenario
-    (lines 427-456), identical except the marked SWAP block."""
+    """riv_instrument_update_rate_experiment.make_scenario with the marked SWAP block changed."""
     theta_true = params_to_theta(cfg.k_true, cfg.tau1_true, cfg.tau2_true, cfg.Ts)
     k0, tau1_0, tau2_0 = perturb_true_params(cfg.k_true, cfg.tau1_true, cfg.tau2_true,
                                               rng, cfg.perturb_frac)
@@ -165,10 +84,9 @@ def make_scenario_real_recon(cfg: Config, rng: np.random.Generator) -> dict:
     p = len(phi_coeffs)
     n = 2 + p
 
-    # --- SWAP (was: u, freqs = make_multisine_input(cfg, rng)) ---
+    # SWAP (was: u, freqs = make_multisine_input(cfg, rng))
     freqs = real_recon_freqs_hz(cfg.fs)
     u = make_weighted_multisine(cfg.N_sim, 0.0, cfg.u_max, cfg.Ts, freqs, _TONE_WEIGHTS, rng)
-    # --- end SWAP ---
 
     A_eta_t, B_eta_t, C_eta_t = theta_to_observer_canonical(theta_true)
     eta_true = simulate_ss(A_eta_t, B_eta_t, C_eta_t, u)
@@ -176,7 +94,7 @@ def make_scenario_real_recon(cfg: Config, rng: np.random.Generator) -> dict:
     A_beta, C_beta = ar_to_state_space(phi_coeffs)
     beta_sim = simulate_ar_beta(A_beta, C_beta, sigma2_ar, cfg.N_sim, rng)
     v = rng.normal(0.0, np.sqrt(cfg.R), size=cfg.N_sim)
-    y_true = beta_sim - eta_true + v  # NO offset term -- matches Entry 47 exactly
+    y_true = beta_sim - eta_true + v  # no offset term
 
     Q_diag = build_process_noise_diag(2, p, cfg.q_eta_default, cfg.q_beta_nominal,
                                        cfg.q_beta_other_default)
@@ -191,12 +109,10 @@ def make_scenario_real_recon(cfg: Config, rng: np.random.Generator) -> dict:
 
 
 def run_seed_real(cfg: Config, seed: int) -> dict:
-    """Mirrors sweep_arm's per-seed body (riv_instrument_update_rate_
-    experiment.py:499-519) for the fixed adaptive arm, with
-    make_scenario_real_recon in place of make_scenario."""
+    """sweep_arm's per-seed body for the adaptive arm, using make_scenario_real_recon."""
     rng = np.random.default_rng(seed)
     scn = make_scenario_real_recon(cfg, rng)
-    eta_aux_full = np.zeros(cfg.N_sim)  # unused placeholder, AUX_DECIMATED ignores it
+    eta_aux_full = np.zeros(cfg.N_sim)  # unused, AUX_DECIMATED ignores it
     x_hat, theta_hat, y_hat, Pkf_final, Prls_final, theta_epoch_hist, _ = run_dual_estimator_instrument(
         scn["u"], scn["y_true"], scn["phi_c"], scn["Q_c"], cfg.R, scn["x0"], scn["P0_kf"],
         scn["theta_hat0"], scn["P0_rls"], cfg.lambda_ff, 2, scn["p"],
@@ -216,19 +132,17 @@ def run_seed_real(cfg: Config, seed: int) -> dict:
                 theta_err=theta_err, k_err=k_err, tau1_err=tau1_err, tau2_err=tau2_err, ok=ok)
 
 
-# ==========================================================================
-# fs sweep -- mirrors riv_sampling_rate_sweep_experiment.py's eval_fs /
-# coarse_descent / bisect_boundary (lines 68-121), same constants.
-# ==========================================================================
+# fs sweep: eval_fs / coarse_descent / bisect_boundary of
+# riv_sampling_rate_sweep_experiment.py, same constants
 
-BASE_CFG = Config()  # fs=50Hz, Ts=0.02 -- Entry 49's confirmed "adaptive" baseline
-N_SEEDS = 30  # bumped from 10 -- tighter ok-rate estimate (SE ~9% vs ~16% at p=0.5)
+BASE_CFG = Config()  # fs=50Hz, Ts=0.02, the "adaptive" baseline
+N_SEEDS = 30  # SE ~9% on ok-rate at p=0.5
 COARSE_RATIO = 1 / 1.4
 OK_RATE_THRESHOLD = 0.5
 ANCHOR_OK_RATE_MIN = 0.8
 BISECT_TOL_FRAC = 0.10
 MIN_FS = 0.5
-MAX_FS = 100.0  # upper end of the coarse ascent above the fs=50Hz anchor
+MAX_FS = 100.0  # upper end of the ascent above the 50Hz anchor
 
 
 def cfg_at_fs(fs: float) -> Config:
@@ -274,13 +188,12 @@ def coarse_descent_real(n_seeds: int = N_SEEDS) -> list[dict]:
 
 
 def coarse_ascent_real(n_seeds: int = N_SEEDS) -> list[dict]:
-    """Mirrors coarse_descent_real but stepping UP from the fs=50Hz anchor
-    (fs *= 1/COARSE_RATIO each step) up to MAX_FS, purely for plot coverage
-    above 50Hz -- no boundary search needed here since ok-rate only rises."""
+    """coarse_descent_real stepping up from the fs=50Hz anchor (fs *= 1/COARSE_RATIO)
+    to MAX_FS, for plot coverage only (ok-rate only rises, so no boundary search)."""
     curve = []
     fs = BASE_CFG.fs
     while True:
-        fs /= COARSE_RATIO  # == fs *= 1.4
+        fs /= COARSE_RATIO
         if fs > MAX_FS:
             break
         curve.append(eval_fs_real(fs, n_seeds=n_seeds))
@@ -306,10 +219,8 @@ OUT_DIR = REPO_ROOT / "results" / "real_recon_multisine_sweep"
 
 def plot_ok_rate_vs_fs_real(curve: list[dict], boundary_fs: float, n_seeds: int, path: Path,
                              logx: bool = False, err_logy: bool = True) -> None:
-    """Duplicate of riv_sampling_rate_sweep_experiment.plot_ok_rate_vs_fs
-    (lines 124-157), identical except the title -- that function's title is
-    hardcoded to the current 3-tone signal's baseline, which would mislabel
-    this real-recon-weighted-multisine sweep's plot."""
+    """riv_sampling_rate_sweep_experiment.plot_ok_rate_vs_fs with its hardcoded
+    3-tone title replaced."""
     pts = sorted(curve, key=lambda r: r["fs"])
     fss = [r["fs"] for r in pts]
     ok_rates = [r["ok_rate"] for r in pts]
@@ -365,7 +276,7 @@ def main() -> None:
 
     print(f"\nboundary bracket: [{fs_fail:.3f}, {fs_pass:.3f}]Hz "
           f"(width {100*(fs_pass/fs_fail-1):.1f}%), geometric-mid estimate ~{boundary_fs:.3f}Hz")
-    print(f"reference: Entry 50 (current 3-tone signal) boundary bracket ~[5.6,6.1]Hz")
+    print("reference: an earlier experiment (current 3-tone signal) boundary bracket ~[5.6,6.1]Hz")
 
     print(f"\ncoarse ascent above the fs=50Hz anchor (up to {MAX_FS}Hz):")
     ascent = coarse_ascent_real()

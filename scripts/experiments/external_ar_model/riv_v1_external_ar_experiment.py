@@ -1,19 +1,15 @@
-"""
-Experiment: does swapping in the higher-order AR shape derived from the
-richer external dataset (derive_external_ar_model.py -> external_ar_model.npz,
-order 12, downsampled exactly to our 25Hz) fix V1's innovation-whiteness
-problem, compared to our own per-recording order-3 fit (forced low by our
-own no-stim segments being too short to support anything higher -- see
-INVESTIGATION.md Entry 10)?
+"""Does the higher-order external AR shape fix V1's innovation whiteness?
 
-The external model's absolute noise scale is NOT reused (different
-recording, different beta amplitude calibration/units -- see
-INVESTIGATION.md). Only its AR order/shape (phi_25hz) is borrowed; sigma2 is
-recomputed by evaluating that shape's residual variance on OUR OWN
-per-recording no-stim segment, so the noise level stays in our data's units.
+Swaps in the order-12 AR shape from derive_external_ar_model.py
+(external_ar_model.npz, downsampled to 25Hz) in place of our per-recording
+order-3 fit, which is limited by short no-stim segments.
 
-This is a cross-dataset structural probe (different subject/session), not a
-silent production swap -- main() is untouched. Report only.
+Only the AR order/shape (phi_25hz) is borrowed. The external noise scale is
+not reused (different recording and units): sigma2 is recomputed as that
+shape's residual variance on our own per-recording no-stim segment.
+
+A cross-dataset structural probe, not a production swap. Report only;
+main() is untouched.
 """
 import contextlib
 import io
@@ -32,8 +28,8 @@ FIG_DIR = Path(__file__).resolve().parent.parent.parent.parent / "results" / "v1
 
 
 def rescaled_sigma2(phi: np.ndarray, segments: list[np.ndarray]) -> float:
-    """Residual variance of a FIXED phi evaluated on OUR OWN segments --
-    borrows the external shape, keeps our own noise scale/units."""
+    """Residual variance of a fixed phi on our own segments: borrows the
+    external shape, keeps our noise scale."""
     order = len(phi)
     rows, targets = [], []
     for s in segments:
@@ -49,7 +45,7 @@ def rescaled_sigma2(phi: np.ndarray, segments: list[np.ndarray]) -> float:
 def main() -> None:
     if not CACHE_PATH.exists():
         raise SystemExit(f"{CACHE_PATH} not found -- run derive_external_ar_model.py first "
-                          f"(needs the OneDrive external dataset mounted).")
+                          f"(needs the external dataset mounted).")
     cache = np.load(CACHE_PATH)
     phi_ext = cache["phi_25hz"]
     print(f"external AR shape: order={len(phi_ext)} (fit on {cache['n_samples']} samples, "
@@ -60,9 +56,8 @@ def main() -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         ar_fits = R.fit_ar_beta_model_per_recording(recordings, cfg)
 
-        # Rebuild the same own/borrowed segment pool fit_ar_beta_model_per_recording
-        # used, so the external shape is rescaled against the SAME data our own
-        # order-3 baseline was fit on (apples to apples).
+        # Rebuild the segment pool fit_ar_beta_model_per_recording used, so the external
+        # shape is rescaled against the data the order-3 baseline was fit on
         all_outputs = np.concatenate([y for _, y in recordings.values()])
         epsilon = R.compute_epsilon_floor(all_outputs)
         thresh = min(u.min() for u, _ in recordings.values()) * cfg.stim_off_tol_frac
@@ -80,7 +75,7 @@ def main() -> None:
         segments = own if own else R._find_ar_donor(
             name, seg_pool, cfg.system_id_files, cfg.controller_files)[0]
         sigma2_ext = rescaled_sigma2(phi_ext, segments)
-        stable, eig = R.ar_stability_check(phi_ext)
+        stable, _ = R.ar_stability_check(phi_ext)
 
         with contextlib.redirect_stdout(io.StringIO()):
             R_base = 0.05 * base["sigma2_ar"]

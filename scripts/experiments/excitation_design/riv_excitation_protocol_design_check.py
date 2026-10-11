@@ -1,16 +1,13 @@
-"""
-Richer-excitation recording protocol design check (RESEARCH_NOTEBOOK.md
-Entry 30/34 flagged next step). Real u has near-unity lag-1 autocorrelation
-(0.98-0.997, measured directly below) despite changing amplitude almost
-every sample -- it is a rate-limited ramp, not a switching/PRBS-like
-excitation, which is why its PE(4) Toeplitz condition number is
-9.4e3-1.2e5 (riv_v1_logparam_diagnostics.pe_order_check) versus ~25-39 for
-the synthetic IID-uniform u the estimator was validated on (Entry 29).
+"""Which property of a future recording protocol would close the PE gap?
 
-This script asks: what property of a *future* recording protocol would
-close that gap? Candidates matched to each real recording's own length N
-and amplitude range [u.min(), u.max()], scored with the SAME pe_order_check
-used everywhere else in this project (no new metric introduced).
+Real u has near-unity lag-1 autocorrelation (0.98-0.997) despite changing
+almost every sample: it is a rate-limited ramp, not a PRBS-like switching
+signal. Its PE(4) Toeplitz condition number is 9.4e3-1.2e5
+(riv_dual_estimation.pe_order_check) vs ~25-39 for the synthetic
+IID-uniform u the estimator was validated on.
+
+Candidate excitations are matched to each real recording's length N and
+amplitude range [u.min(), u.max()] and scored with the same pe_order_check.
 """
 from __future__ import annotations
 
@@ -19,9 +16,7 @@ import numpy as np
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "estimators/v1"))
-_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "experiments/v1_logparam"))
-from riv_dual_estimation import CFG, load_all_recordings
-from riv_v1_logparam_diagnostics import pe_order_check
+from riv_dual_estimation import CFG, load_all_recordings, pe_order_check
 
 
 def acf1(x: np.ndarray) -> float:
@@ -42,9 +37,8 @@ def make_prbs2(n: int, lo: float, hi: float, dwell: int, rng: np.random.Generato
 
 def make_aprbs(n: int, lo: float, hi: float, min_dwell: int, max_dwell: int,
                 rng: np.random.Generator) -> np.ndarray:
-    """Amplitude-modulated PRBS: independent uniform level, held for a random
-    dwell in [min_dwell, max_dwell] samples -- standard rich-excitation design
-    (Ljung ch.13; Nelles 'Nonlinear System Identification' sec 17.5)."""
+    """Amplitude-modulated PRBS: independent uniform level held for a random
+    dwell in [min_dwell, max_dwell] samples (Ljung ch.13; Nelles sec 17.5)."""
     out = np.empty(n)
     i = 0
     while i < n:

@@ -1,39 +1,9 @@
-"""
-Experiment: Entry 15 showed real beta's zero-mean FLUCTUATION shape is not
-why V1 fails on real data (semi-synthetic ~= fully-synthetic, both >> real).
-But Entry 15's semi-synthetic baseline was a FLAT constant (c0=mean(real y))
-for the whole recording -- exactly what V1's offset state (constant/slow-
-drift dynamics, A_off=1) is best at absorbing. Real data measurably is NOT
-flat: `simple_controllers_1/2` (the only recordings with >1 no-stim segment,
-see F5) show baseline drift std = 0.12-0.18 across a 170s recording, 18-28%
-of that recording's total std(y) (measured directly, see
-BASELINE_DRIFT_REPORT.md / INVESTIGATION.md Entry 18).
 
-This experiment adds a controlled, swept-magnitude SLOW baseline drift (a
-smooth piecewise-linear trajectory through a few random anchor points,
-mirroring the handful-of-distinct-segment-levels structure actually
-observed) on top of Entry 15's semi-synthetic construction (real
-block-bootstrapped beta fluctuation + known eta from the real u). Everything
-else held fixed. One variable changed: drift magnitude, swept from 0
-(Entry 15's flat case, known-good) up through and past the empirically
-measured real range (~20-30% of std(y)).
-
-If k-recovery degrades as drift magnitude increases -- especially degrading
-through the empirically-real 20-30% range -- that is direct, controlled
-evidence that baseline non-stationarity (not beta's fluctuation shape, not
-excitation, both ruled out in Entry 15) is what the offset state's
-near-constant assumption cannot track, and is the real-data-specific
-mechanism Entry 15 left as its top open hypothesis.
-
-main() is untouched -- report only. See INVESTIGATION.md Entry 18.
-"""
 import contextlib
 import io
 from pathlib import Path
-
 import numpy as np
 import matplotlib.pyplot as plt
-
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "estimators/v1"))
@@ -45,16 +15,13 @@ K_TRUE, TAU1_TRUE, TAU2_TRUE = 80.0, 0.05, 0.25
 N_SEEDS = 4
 BLOCK_LEN = 15
 MEAS_NOISE_STD = 0.02
-N_ANCHORS = 5  # matches the 5 real no-stim segments measured on simple_controllers
-DRIFT_FRACS = (0.0, 0.1, 0.2, 0.3, 0.5)  # fraction of std(real y); real data measured ~0.18-0.28
+N_ANCHORS = 5  # the 5 real no-stim segments on simple_controllers
+DRIFT_FRACS = (0.0, 0.1, 0.2, 0.3, 0.5)  # fraction of std(real y); real ~0.18-0.28
 
 
 def drift_baseline(N: int, target_std: float, n_anchors: int, rng: np.random.Generator) -> np.ndarray:
-    """Smooth low-frequency baseline: piecewise-linear interpolation through
-    n_anchors random levels spread across the recording, std of the anchor
-    values = target_std. Mirrors the observed real structure (a handful of
-    distinct segment-mean levels over the recording) rather than a smooth
-    parametric AR(1) with an arbitrary time constant."""
+    """Piecewise-linear baseline through n_anchors random levels (anchor std =
+    target_std), mirroring the handful of segment-mean levels seen in real data."""
     if target_std <= 0:
         return np.zeros(N)
     anchor_idx = np.linspace(0, N - 1, n_anchors)
@@ -68,7 +35,7 @@ def _check_drift_baseline() -> None:
     assert np.all(flat == 0.0)
     drifted = drift_baseline(1000, 1.0, 5, rng)
     assert len(drifted) == 1000
-    assert 0.1 < drifted.std() < 1.0  # anchor std != trajectory std exactly (interpolation smooths it), same order
+    assert 0.1 < drifted.std() < 1.0  # interpolation smooths, so anchor std != trajectory std exactly
 
 
 def main() -> None:

@@ -1,27 +1,8 @@
-"""
-Experiment: SEMISYNTHETIC_VS_REAL_REPORT.md next step #3 (lower priority).
-Effect size of two of Entry 17's newly-identified architectural items on
-real-data k, plus the one-line q_eta-per-recording change. The RIV
-instrument-feedback item is NOT re-tested here -- Entry 12 already
-indirectly tested it (lagged_u has zero theta-feedback and was worse than
-the current aux-model instrument), treated as resolved.
 
-1. Per-epoch KF state reset: run_dual_estimator resets x (eta, beta
-   substates, offset) to the seeded x0 at the start of every epoch, only
-   theta carries forward. Variant here carries x forward too and compares
-   final k on all 6 real recordings.
-2. q_eta global-pooled vs per-recording: main() uses one q_eta value
-   (0.5*var(y) pooled over all 6 recordings); compares against
-   0.5*var(that recording's own y).
-
-main() untouched -- report only.
-"""
 import contextlib
 import io
 from pathlib import Path
-
 import numpy as np
-
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "estimators/v1"))
@@ -33,9 +14,8 @@ FIG_DIR = Path(__file__).resolve().parent.parent.parent.parent / "results" / "v1
 def run_dual_estimator_carry_state(u, y, phi_ar, Q_diag, R_noise, x0, P0_kf, theta0, P0_rls,
                                     lam, n_eta, p, n_off, gamma_pole, a1_prior, a2_prior,
                                     n_epochs):
-    """Same as R.run_dual_estimator, except x is carried forward across
-    epochs (final x_hat[-1] seeds the next epoch) instead of resetting to
-    x0 every time. Isolated here, not touching the production function."""
+    """R.run_dual_estimator, except x_hat[-1] seeds the next epoch instead of
+    resetting to x0."""
     n = n_eta + p + n_off
     theta_cur = np.ascontiguousarray(theta0, dtype=np.float64).copy()
     x_cur = np.ascontiguousarray(x0, dtype=np.float64).copy()

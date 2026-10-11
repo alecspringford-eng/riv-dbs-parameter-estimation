@@ -1,13 +1,11 @@
-"""
-Entry 41 found, on ONE seed/recording, that V1's P_rls(a1,a2) min
-eigenvalue is 15x smaller under a bad synthetic u than under real u --
-matching the codebase's own pre-existing "confidently wrong" diagnostic
-(riv_dual_estimation.py ~line 1691-1696: small/collapsed P_rls block that
-still lands wrong = recursion bias/attractor, not unresolved excitation).
-This script replicates that across N_SEEDS seeds and 3 recordings (Entry
-41's flagged next step) to check whether smaller P_rls(a1,a2) min
-eigenvalue actually correlates with WORSE recovery in general, or whether
-the single seed/recording result was a coincidence.
+"""Does a smaller P_rls(a1,a2) min eigenvalue go with worse recovery?
+
+On one seed/recording, V1's P_rls(a1,a2) min eigenvalue was 15x smaller under
+a bad synthetic u than under real u, matching the "confidently wrong"
+diagnostic in riv_dual_estimation.py (a small, collapsed P_rls block that
+still lands wrong means recursion bias/attractor, not unresolved
+excitation). This replicates it over N_SEEDS seeds and 3 recordings to see
+whether the correlation holds or was a coincidence.
 """
 from __future__ import annotations
 
@@ -114,7 +112,7 @@ def main() -> None:
     print(f"Pooled (both conditions, all recordings, N={len(pooled_min_eig)}): "
           f"Spearman rho(log min_eig_a1a2, log k_err) = {rho:.3f} (p={pval:.2e})")
     print("(rho<0: smaller min eigenvalue [more 'collapsed'/confident] associates with LARGER "
-          "error -- the 'confidently wrong' pattern from Entry 41. rho>0 or ~0 would contradict it.)")
+          "error -- the 'confidently wrong' pattern from an earlier experiment. rho>0 or ~0 would contradict it.)")
 
 
 if __name__ == "__main__":

@@ -42,7 +42,7 @@ def test_run_logparam_arm_recovers_reasonable_k():
     assert set(result) == {"k_final", "tau1_final", "tau2_final", "ok",
                             "k_online", "tau1_online", "tau2_online"}
     assert result["k_online"].shape == (500,)
-    assert np.all(result["k_online"] > 0)  # logparam is structurally positive-k by construction
+    assert np.all(result["k_online"] > 0)
     assert np.all(np.isfinite(result["k_online"]))
 
 

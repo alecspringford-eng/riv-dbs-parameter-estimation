@@ -1,62 +1,39 @@
-"""riv_raw_real_replay_sweep_check.py -- same fs sweep as
-riv_real_recon_multisine_sweep_check.py, but instead of reconstructing a
-10-tone multisine FROM the real recording's spectrum, this replays the
-ACTUAL recorded waveform itself (real_recordings/delay_5/
-system_id_long_run.csv, N=6120 samples, native Ts=0.04s/fs=25Hz),
-resampled to whatever Ts the current sweep point needs and tiled to fill
-N_sim=80000 samples (the recording is confirmed near-exactly periodic --
-see riv_real_recon_multisine_sweep_check.py's FFT: a clean harmonic
-series, fundamental ~0.249Hz with 9 exact harmonics and no broadband
-content -- so periodic tiling introduces no discontinuity beyond what's
-already in the recording itself).
+"""fs sweep with the raw recorded input replayed as u.
 
-Resampling: linear interpolation of the recorded u(t) against continuous
-time, wrapped with period = (recording length) * native Ts, via
-np.interp(..., period=...). This is literally "what would this sampling
-rate see if the real stimulation hardware ran at this fs" -- not a
-frequency-content approximation like the multisine reconstruction.
+Same sweep as riv_real_recon_multisine_sweep_check.py, but instead of a
+10-tone multisine reconstructed from the real spectrum, the actual recorded
+waveform (real_recordings/delay_5/system_id_long_run.csv, N=6120 at native
+Ts=0.04s) is resampled to the sweep point's Ts and tiled to fill N_sim=80000.
+The recording is near-exactly periodic (fundamental ~0.249Hz with 9 exact
+harmonics and no broadband content), so tiling adds no discontinuity.
 
-Amplitude: same convention as riv_real_recon_multisine_sweep_check.py --
-the raw real trace (native range ~0.004-0.026) is linearly rescaled to
-[0, cfg.u_max=2.5] (same rescale-to-envelope mechanism as make_multisine's
-own (x-min)/(max-min) step) so the comparison isolates waveform SHAPE
-(what the real recording actually looks like, unweighted-by-decomposition)
-from amplitude budget, exactly matching the other two signal variants
-already tested this session.
+Resampling is np.interp against continuous time wrapped with
+period = len * native Ts, i.e. what that sampling rate would see if the real
+stimulation hardware ran at this fs. The trace (native range ~0.004-0.026) is
+rescaled to [0, cfg.u_max=2.5], as in the other signal variants, so only
+waveform shape differs.
 
-Reused, unmodified (no source file below is edited in place): Config,
-AUX_DECIMATED, perturb_true_params, run_dual_estimator_instrument (from
-riv_instrument_update_rate_experiment.py), synthesize_ar_beta_fallback,
-simulate_ar_beta (riv_single_pole_50hz_replication_check.py), theta/
-state-space/AR helpers (riv_dual_estimation.py). make_scenario_raw_real is
-a byte-for-byte duplicate of riv_instrument_update_rate_experiment.
-make_scenario (lines 427-456) with only the input-generation line swapped.
-eval_fs_raw/coarse_descent_raw/coarse_ascent_raw/bisect_boundary_raw
-duplicate riv_sampling_rate_sweep_experiment.py's sweep algorithm (lines
-68-121), same constants (COARSE_RATIO=1/1.4, OK_RATE_THRESHOLD=0.5,
-ANCHOR_OK_RATE_MIN=0.8, BISECT_TOL_FRAC=0.10, N_SEEDS=30) for direct
-comparability with Entry 50 and the multisine-reconstruction run.
+Reused unmodified: Config, AUX_DECIMATED, perturb_true_params,
+run_dual_estimator_instrument (riv_instrument_update_rate_experiment.py),
+synthesize_ar_beta_fallback, simulate_ar_beta, and the sweep constants
+(COARSE_RATIO=1/1.4, OK_RATE_THRESHOLD=0.5, ANCHOR_OK_RATE_MIN=0.8,
+BISECT_TOL_FRAC=0.10, N_SEEDS=10) for comparability with the earlier
+~5.6-6.1Hz boundary.
 
-Difference from the other two signal scripts: u itself is now fully
-deterministic given cfg.Ts/cfg.N_sim (no rng draws at all for u -- there's
-no phase/tone parameterization to randomize). So run_seed_raw's rng stream
-is NOT shifted relative to the ORIGINAL make_multisine_input's 3-phase
-draw the way the multisine-reconstruction scripts' rng stream was -- u
-generation here consumes zero rng draws, so for a given seed,
-theta_true/theta_hat0/AR(12) coefficients match the current-signal run
-exactly, but beta_sim/v still differ from it (different number of
-subsequent draws consumed: 0 here vs 3 in the original vs 10 in the
-multisine reconstruction) -- so this is, again, not a seed-paired
-ablation against either prior run, only against itself across fs.
+Caveat: u consumes no rng draws here (0, vs 3 in the original and 10 in the
+multisine reconstruction), so for a given seed theta_true/theta_hat0/AR(12)
+coefficients match the original-signal run but beta_sim/v differ. This is
+not a seed-paired ablation against either prior run, only against itself
+across fs.
 
-Run: python3 scripts/riv_raw_real_replay_sweep_check.py
+Run: python3 scripts/experiments/real_data_checks/riv_raw_real_replay_sweep_check.py
 """
 from __future__ import annotations
 
 import dataclasses
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))  # repo root, for riv_* module imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))  # repo root
 
 import numpy as np
 import matplotlib
@@ -81,25 +58,23 @@ from riv_instrument_update_rate_experiment import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 REAL_CSV = REPO_ROOT / "real_recordings" / "delay_5" / "system_id_long_run.csv"
-REAL_TS = 0.04  # native Ts of the real-recordings dataset (riv_dual_estimation.py Config.Ts)
+REAL_TS = 0.04  # native Ts of the real recordings (Config.Ts)
 
 _U_REAL = np.genfromtxt(REAL_CSV, delimiter=",", skip_header=1, usecols=0)
 _NATIVE_T = np.arange(len(_U_REAL)) * REAL_TS
-_PERIOD_S = len(_U_REAL) * REAL_TS  # whole recording tiled as one repeating block
+_PERIOD_S = len(_U_REAL) * REAL_TS  # whole recording is one repeating block
 
 
 def raw_real_u(Ts: float, N: int, lo: float, hi: float) -> np.ndarray:
-    """Resample the real recorded u to Ts via linear interpolation (period-
-    wrapped over the recording length), tile to N samples, rescale to
-    [lo,hi] (same min-max rescale mechanism as make_multisine)."""
+    """Resample the real u to Ts by period-wrapped linear interpolation, tile to
+    N samples, and min-max rescale to [lo, hi] as make_multisine does."""
     t_query = np.arange(N) * Ts
     u = np.interp(t_query, _NATIVE_T, _U_REAL, period=_PERIOD_S)
     return lo + (u - u.min()) / (u.max() - u.min()) * (hi - lo)
 
 
 def make_scenario_raw_real(cfg: Config, rng: np.random.Generator) -> dict:
-    """Duplicate of riv_instrument_update_rate_experiment.make_scenario
-    (lines 427-456), identical except the marked SWAP block."""
+    """riv_instrument_update_rate_experiment.make_scenario with the marked SWAP block changed."""
     theta_true = params_to_theta(cfg.k_true, cfg.tau1_true, cfg.tau2_true, cfg.Ts)
     k0, tau1_0, tau2_0 = perturb_true_params(cfg.k_true, cfg.tau1_true, cfg.tau2_true,
                                               rng, cfg.perturb_frac)
@@ -109,9 +84,8 @@ def make_scenario_raw_real(cfg: Config, rng: np.random.Generator) -> dict:
     p = len(phi_coeffs)
     n = 2 + p
 
-    # --- SWAP (was: u, freqs = make_multisine_input(cfg, rng)) ---
+    # SWAP (was: u, freqs = make_multisine_input(cfg, rng)); no rng draw here
     u = raw_real_u(cfg.Ts, cfg.N_sim, 0.0, cfg.u_max)
-    # --- end SWAP (no rng draw here, unlike either multisine variant) ---
 
     A_eta_t, B_eta_t, C_eta_t = theta_to_observer_canonical(theta_true)
     eta_true = simulate_ss(A_eta_t, B_eta_t, C_eta_t, u)
@@ -119,7 +93,7 @@ def make_scenario_raw_real(cfg: Config, rng: np.random.Generator) -> dict:
     A_beta, C_beta = ar_to_state_space(phi_coeffs)
     beta_sim = simulate_ar_beta(A_beta, C_beta, sigma2_ar, cfg.N_sim, rng)
     v = rng.normal(0.0, np.sqrt(cfg.R), size=cfg.N_sim)
-    y_true = beta_sim - eta_true + v  # NO offset term -- matches Entry 47 exactly
+    y_true = beta_sim - eta_true + v  # no offset term
 
     Q_diag = build_process_noise_diag(2, p, cfg.q_eta_default, cfg.q_beta_nominal,
                                        cfg.q_beta_other_default)
@@ -134,12 +108,10 @@ def make_scenario_raw_real(cfg: Config, rng: np.random.Generator) -> dict:
 
 
 def run_seed_raw(cfg: Config, seed: int) -> dict:
-    """Mirrors sweep_arm's per-seed body (riv_instrument_update_rate_
-    experiment.py:499-519) for the fixed adaptive arm, with
-    make_scenario_raw_real in place of make_scenario."""
+    """sweep_arm's per-seed body for the adaptive arm, using make_scenario_raw_real."""
     rng = np.random.default_rng(seed)
     scn = make_scenario_raw_real(cfg, rng)
-    eta_aux_full = np.zeros(cfg.N_sim)  # unused placeholder, AUX_DECIMATED ignores it
+    eta_aux_full = np.zeros(cfg.N_sim)  # unused, AUX_DECIMATED ignores it
     x_hat, theta_hat, y_hat, Pkf_final, Prls_final, theta_epoch_hist, _ = run_dual_estimator_instrument(
         scn["u"], scn["y_true"], scn["phi_c"], scn["Q_c"], cfg.R, scn["x0"], scn["P0_kf"],
         scn["theta_hat0"], scn["P0_rls"], cfg.lambda_ff, 2, scn["p"],
@@ -159,12 +131,10 @@ def run_seed_raw(cfg: Config, seed: int) -> dict:
                 theta_err=theta_err, k_err=k_err, tau1_err=tau1_err, tau2_err=tau2_err, ok=ok)
 
 
-# ==========================================================================
-# fs sweep -- mirrors riv_sampling_rate_sweep_experiment.py's eval_fs /
-# coarse_descent / bisect_boundary (lines 68-121), same constants.
-# ==========================================================================
+# fs sweep: eval_fs / coarse_descent / bisect_boundary of
+# riv_sampling_rate_sweep_experiment.py, same constants
 
-BASE_CFG = Config()  # fs=50Hz, Ts=0.02 -- Entry 49's confirmed "adaptive" baseline
+BASE_CFG = Config()  # fs=50Hz, Ts=0.02,
 N_SEEDS = 30
 COARSE_RATIO = 1 / 1.4
 OK_RATE_THRESHOLD = 0.5
@@ -203,11 +173,6 @@ def coarse_descent_raw(n_seeds: int = N_SEEDS) -> list[dict]:
     anchor = eval_fs_raw(fs, n_seeds=n_seeds)
     curve.append(anchor)
     if anchor["ok_rate"] < ANCHOR_OK_RATE_MIN:
-        # ponytail: unlike riv_sampling_rate_sweep_experiment.py's ANCHOR_OK_RATE_MIN
-        # check (which guards "does the pipeline still reproduce Entry 49 with the
-        # SAME signal"), this script deliberately swaps the signal itself -- a
-        # degraded fs=50 anchor here is the finding, not a pipeline bug. Warn and
-        # keep going instead of aborting.
         print(f"  WARNING: fs={fs}Hz anchor ok-rate={anchor['ok_rate']:.2f} is below "
               f"the original-signal sanity floor ({ANCHOR_OK_RATE_MIN}) -- expected, "
               "this signal is already degraded at the baseline rate. Continuing anyway.")
@@ -249,8 +214,7 @@ OUT_DIR = REPO_ROOT / "results" / "raw_real_replay_sweep"
 
 def plot_ok_rate_vs_fs_raw(curve: list[dict], boundary_fs: float, n_seeds: int, path: Path,
                             logx: bool = False, err_logy: bool = True) -> None:
-    """Duplicate of riv_sampling_rate_sweep_experiment.plot_ok_rate_vs_fs
-    (lines 124-157), title corrected for this signal."""
+    """riv_sampling_rate_sweep_experiment.plot_ok_rate_vs_fs with this signal's title."""
     pts = sorted(curve, key=lambda r: r["fs"])
     fss = [r["fs"] for r in pts]
     ok_rates = [r["ok_rate"] for r in pts]
@@ -304,7 +268,7 @@ def main() -> None:
 
         print(f"\nboundary bracket: [{fs_fail:.3f}, {fs_pass:.3f}]Hz "
               f"(width {100*(fs_pass/fs_fail-1):.1f}%), geometric-mid estimate ~{boundary_fs:.3f}Hz")
-        print("reference: Entry 50 (current 3-tone signal) boundary bracket ~[5.6,6.1]Hz")
+        print("reference: an earlier experiment (current 3-tone signal) boundary bracket ~[5.6,6.1]Hz")
         print("reference: real-recon weighted-multisine boundary ~12.48Hz")
 
     print(f"\ncoarse ascent above the fs=50Hz anchor (up to {MAX_FS}Hz):")

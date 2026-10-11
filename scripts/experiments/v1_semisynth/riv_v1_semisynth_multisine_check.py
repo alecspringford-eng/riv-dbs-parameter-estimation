@@ -1,23 +1,18 @@
-"""
-Entry 36 found a well-conditioned 3-tone multisine (PE4 cond ~1e3, ACF1
-0.64) still recovers WORSE than real u (cond 9.4e3-1.2e5, ACF1 0.98-0.997)
-in V1's semi-synthetic construction -- i.e. static PE conditioning alone
-does not predict V1's online recursive convergence. Follow-up question:
-is the multisine's PERIODICITY (a short cycle replayed many times) the
-missing variable, separate from its conditioning/autocorrelation numbers?
-Adds PRBS2 (2-level, dwell=1, aperiodic pseudo-random) and APRBS
-(independent-per-dwell random level, aperiodic) as two more input
-conditions -- both are non-periodic like real u, letting periodicity be
-varied independently of PE cond and ACF1 (PRBS2 has the best PE
-conditioning of anything tested AND near-zero autocorrelation AND is
-aperiodic; multisine has good-but-worse conditioning, low autocorrelation,
-AND is periodic -- if PRBS converges and multisine doesn't, periodicity,
-not conditioning, is implicated).
+"""Is periodicity the missing variable in V1's semi-synthetic recovery?
 
-Same construction as riv_v1_semisynth_experiment.main() with ONE variable
-changed: u. All conditions scored on (a) V1 k/tau1/tau2 recovery and (b)
-the same pe_order_check used in Entry 30/35/36, measured on the exact
-input fed to the estimator, not inferred separately.
+A well-conditioned 3-tone multisine (PE4 cond ~1e3, ACF1 0.64) still
+recovers worse than real u (cond 9.4e3-1.2e5, ACF1 0.98-0.997) in V1's
+semi-synthetic construction, so static PE conditioning alone does not predict
+V1's recursive convergence. This adds two aperiodic inputs, PRBS2 (2-level,
+dwell=1) and APRBS (independent random level per dwell), so periodicity can
+vary independently of PE conditioning and ACF1. PRBS2 has the best
+conditioning and near-zero autocorrelation and is aperiodic; the multisine
+is worse conditioned and periodic. If PRBS converges and the multisine does
+not, periodicity is implicated.
+
+Same construction as riv_v1_semisynth_experiment.main() with only u changed.
+Each condition is scored on V1 k/tau1/tau2 recovery and on pe_order_check
+measured on the exact input fed to the estimator.
 """
 from __future__ import annotations
 
@@ -32,24 +27,20 @@ from scipy.signal import lfilter
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "estimators/v1"))
-_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "experiments/v1_logparam"))
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "experiments/excitation_design"))
 import riv_dual_estimation as R
 from riv_v1_semisynth_experiment import moving_block_bootstrap
-from riv_v1_logparam_diagnostics import pe_order_check
 from riv_excitation_protocol_design_check import make_prbs2, make_aprbs, acf1
 
 FIG_DIR = Path(__file__).resolve().parent.parent.parent.parent / "results" / "v1_diagnostics"
 K_TRUE, TAU1_TRUE, TAU2_TRUE = 62.11, 0.05, 0.25
-N_SEEDS = 30  # bumped from 6 (Entry 38 next-step (a): resolve whether the 2/6
-# recordings that moved the "wrong" direction under shuffling are real or seed noise
+N_SEEDS = 30
 BLOCK_LEN = 15
 MEAS_NOISE_STD = 0.02
-TONES_HZ = (0.5, 2.0, 6.0)  # log/octave-spaced -- (0.3,1.0,3.0) tested first and
-# scored PE4 cond 1.5e4-2.6e4 (worse than this set's ~1e3-3e3, see script docstring
-# investigation log): near-harmonic ratios (3.33x, 3x) between closely-linear-spaced
-# tones make the Toeplitz matrix ill-conditioned regardless of tone COUNT -- frequency
-# spacing, not just how many tones, determines PE conditioning for a multisine.
+# Log/octave-spaced: (0.3, 1.0, 3.0) scored PE4 cond 1.5e4-2.6e4 vs ~1e3-3e3 here.
+# Near-harmonic ratios between linearly spaced tones ill-condition the Toeplitz
+# matrix regardless of tone count.
+TONES_HZ = (0.5, 2.0, 6.0)
 
 
 def make_multisine(n: int, lo: float, hi: float, Ts: float, freqs_hz: tuple[float, ...],
@@ -63,20 +54,18 @@ def make_multisine(n: int, lo: float, hi: float, Ts: float, freqs_hz: tuple[floa
 
 
 def _exp_smooth(x: np.ndarray, alpha: float) -> np.ndarray:
-    """Causal first-order low-pass (rate limiter surrogate):
-    y[k] = alpha*x[k] + (1-alpha)*y[k-1]. alpha=1 -> no smoothing,
-    alpha->0 -> heavy smoothing (y nearly constant). IIR form via lfilter
-    for speed (called many times inside the alpha-calibration bisection)."""
+    """Causal first-order low-pass, y[k] = alpha*x[k] + (1-alpha)*y[k-1]
+    (rate-limiter surrogate). alpha=1 is no smoothing. Uses lfilter because it
+    is called repeatedly in the alpha-calibration bisection."""
     return lfilter([alpha], [1.0, -(1.0 - alpha)], x)
 
 
 def make_rate_limited_aprbs(n: int, lo: float, hi: float, min_dwell: int, max_dwell: int,
                              target_diff_std: float, rng: np.random.Generator) -> np.ndarray:
-    """Entry 39's flagged combined surrogate: APRBS (aperiodic, Entry 35/37's
-    best-performing synthetic input) passed through a rate limiter, alpha
-    calibrated so the OUTPUT's increment std matches real u's (0.0005-0.0012)
-    -- tests whether increment scale + aperiodicity together close the
-    remaining gap to real u (49% vs APRBS's un-smoothed 35%)."""
+    """APRBS passed through a rate limiter, with alpha calibrated so the
+    output's increment std matches real u's (0.0005-0.0012). Tests whether
+    increment scale plus aperiodicity close the remaining gap to real u
+    (49% vs 35% for un-smoothed APRBS)."""
     raw = make_aprbs(n, 0.0, 1.0, min_dwell, max_dwell, rng)
 
     def diff_std_at(alpha: float) -> float:
@@ -142,7 +131,7 @@ def main() -> None:
             for seed in range(N_SEEDS):
                 rng = np.random.default_rng(seed)
                 u = u_variant_fn(rng)
-                pe4_conds.append(pe_order_check(u, 4)["cond"])
+                pe4_conds.append(R.pe_order_check(u, 4)["cond"])
                 acf1s.append(acf1(u))
                 du = np.diff(u)
                 diff_stds.append(float(du.std()))

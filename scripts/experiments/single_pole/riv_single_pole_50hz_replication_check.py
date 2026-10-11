@@ -1,38 +1,26 @@
-"""riv_single_pole_50hz_replication_check.py -- faithful single-pole port of
-the OLD prototype scenario that DID recover parameters reliably
-(".../Internship/Code/Personal_Code/Linear-models/RIV Kalman filter/
-riv_dual_estimation.py", predates this repo; INVESTIGATION.md Entry 16).
+"""Single-pole port of the old prototype scenario that recovered parameters
+reliably (predates this repo), with (k, tau) in place of (k, tau1, tau2).
 
-Per user: same setup as the one that worked, swapped to (k, tau) instead
-of (k, tau1, tau2). Ported exactly, not reusing this repo's 2026-data-
-amplitude-matched build_kf_setup_1p, since fidelity to what worked is the
-point:
-  - fs=50 Hz (Ts=0.02), N_sim=80000 (vs this repo's 25 Hz/N~3000)
-  - u: rate-limited multisine, amplitude scale u_max=2.5 (own scale, not
-    matched to real u -- so the noise constants below are self-consistent
-    with it, not mismatched the way Entry 43 found the ported-verbatim
-    constants to be when dropped into real-u-scaled code)
-  - NO offset term in y_true and NO offset state in the KF (n_off=0) --
-    the old script's synthetic y never had a baseline for eta to absorb,
-    so root cause 1 (offset-hijack) cannot manifest here regardless
-  - initial guess perturbed +-50% around the TRUE value, not this repo's
-    fixed generic AVG_PATIENT_PARAMS prior (which can be arbitrarily far
-    from an arbitrary true tau)
-  - fixed (non-data-driven) R=0.1, q_eta=1e4, q_beta_nominal=5.0,
-    q_beta_other=0.1
+Ported exactly rather than reusing this repo's amplitude-matched
+build_kf_setup_1p, since fidelity to the working setup is the point:
+  - fs=50 Hz (Ts=0.02), N_sim=80000 (this repo: 25 Hz, N~3000)
+  - u: rate-limited multisine with u_max=2.5 (its own scale, so the noise
+    constants below are self-consistent with it)
+  - no offset term in y_true and no offset state in the KF (n_off=0), so the
+    offset-hijack failure cannot occur
+  - initial guess perturbed +-50% around the true value, not this repo's
+    fixed AVG_PATIENT_PARAMS prior
+  - fixed R=0.1, q_eta=1e4, q_beta_nominal=5.0, q_beta_other=0.1
 
-Reuses riv_single_pole_estimation.py's already-validated core
-(_dual_estimator_core_1p, run_dual_estimator_1p, etc.) and
-riv_dual_estimation.py's pole-count-agnostic ar_to_state_space /
-build_process_noise_diag. Does not modify either file.
+Reuses riv_single_pole_estimation.py's core (_dual_estimator_core_1p,
+run_dual_estimator_1p, ...) and riv_dual_estimation.py's pole-count-agnostic
+ar_to_state_space / build_process_noise_diag, without modifying either.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 
 import numpy as np
-from scipy import signal
 
 import sys as _sys
 from pathlib import Path as _Path
@@ -51,7 +39,7 @@ class OldConfig:
     fs: float = 50.0
     Ts: float = 0.02
     k_true: float = 62.11
-    tau_true: float = 0.05          # single pole -- old script's own tau1_true
+    tau_true: float = 0.05          # the old script's tau1_true
     perturb_frac: float = 0.5
     seed: int = 0
     u_max: float = 2.5
@@ -128,7 +116,7 @@ def run_replication(cfg: OldConfig = OldConfig(), seed: int | None = None) -> di
 
     phi_coeffs, sigma2_ar = synthesize_ar_beta_fallback(rng, cfg.p_ar_fallback, cfg.sigma2_ar_fallback)
     p = len(phi_coeffs)
-    n = N_ETA_1P + p  # NO offset state -- matches the old script exactly
+    n = N_ETA_1P + p  # no offset state, as in the old script
 
     u, freqs = make_multisine_input(cfg, rng)
 
@@ -138,7 +126,7 @@ def run_replication(cfg: OldConfig = OldConfig(), seed: int | None = None) -> di
     A_beta, C_beta = ar_to_state_space(phi_coeffs)
     beta_sim = simulate_ar_beta(A_beta, C_beta, sigma2_ar, cfg.N_sim, rng)
     v = rng.normal(0.0, np.sqrt(cfg.R), size=cfg.N_sim)
-    y_true = beta_sim - eta_true + v   # NO offset term -- matches the old script exactly
+    y_true = beta_sim - eta_true + v   # no offset term, as in the old script
 
     Q_diag = np.concatenate((build_process_noise_diag(N_ETA_1P, p, cfg.q_eta_default,
                                                         cfg.q_beta_nominal, cfg.q_beta_other_default),))

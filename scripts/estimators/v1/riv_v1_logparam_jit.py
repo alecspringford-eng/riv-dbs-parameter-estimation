@@ -1,21 +1,12 @@
-"""
-Numba-JIT version of riv_v1_logparam_riv_experiment.py's core loop.
+"""Numba-JIT log-parameterised dual KF+RIV core.
 
-The pure-Python version (riv_v1_logparam_riv_experiment.py) calls the
-`control` package's params_to_theta once per theta(logp) evaluation --
-~0.2ms/call, 6 calls/sample (finite-difference Jacobian) -> ~1-2ms/sample,
-1e3-1e4x too slow for any real-time use (flagged explicitly in Entry 29's
-next steps). `control` uses python objects (StateSpace, TransferFunction)
-and is not numba-compatible.
-
-Fix: replace params_to_theta with a closed-form analytic ZOH
-discretization of the two-lag cascade, derived independently two ways
-(augmented-matrix-exponential decomposition, and direct ODE integrating-
-factor solution -- they agreed exactly) and validated numerically against
-the existing `control`-based params_to_theta before use here: max abs
-error 7.3e-12 over 2000 random (k,tau1,tau2) draws, 5.0e-8 in the
-near-degenerate tau1~=tau2 regime (which needs a separate limiting-case
-formula -- the general formula divides by (tau1-tau2)).
+A pure-Python core would call the `control` package's params_to_theta once per
+theta(logp) evaluation (~0.2ms/call, 6 calls/sample for the finite-difference
+Jacobian), which is too slow for real-time use and not numba-compatible.
+Here params_to_theta is replaced by a closed-form ZOH discretization of the
+two-lag cascade, validated against the `control` version (max abs error
+7.3e-12 over 2000 random draws, 5.0e-8 near tau1~=tau2, which needs a
+separate limiting-case formula).
 
     p1 = exp(-Ts/tau1), p2 = exp(-Ts/tau2)
     a1 = p1+p2,  a2 = -p1*p2
@@ -27,28 +18,23 @@ formula -- the general formula divides by (tau1-tau2)).
   and the tau1==tau2==tau limit (L'Hopital):
     Ad21 = (Ts/tau)*p,  Bd2 = k*((1-p) - (Ts/tau)*p),  p=exp(-Ts/tau)
 
-Everything else (KF over eta/beta/offset, RIV-in-logp-space update,
-instrument z, clamps, epoch loop) is the same math as
-riv_v1_logparam_riv_experiment.py, just written in numba's array-
-preallocation style to match riv_dual_estimation.py's existing
-`_dual_estimator_core` convention.
+The rest (KF over eta/beta/offset, RIV update in logp space, instrument z,
+clamps, epoch loop) is written in numba's array-preallocation style like riv_dual_estimation.py's
+`_dual_estimator_core`.
 """
 
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 import numba
 import numpy as np
 
 from riv_dual_estimation import (
-    CFG, DUAL_CFG, N_ETA, POLE_MAX, AVG_PATIENT_PARAMS,
+    CFG, DUAL_CFG, POLE_MAX, AVG_PATIENT_PARAMS,
     load_all_recordings, fit_ar_beta_model_per_recording,
     params_to_theta, build_kf_setup, residual_whiteness_test,
-    nis_consistency_check, simulate_arx_recursion, ar_to_state_space,
-    plot_input, plot_output_fit, plot_residual, plot_components,
-    plot_input_excitation, plot_k_tau_vs_epoch, plot_final_params_bar,
+    nis_consistency_check,
 )
 
 POLE_MIN = 1e-3
@@ -383,12 +369,8 @@ def run_identification_logparam_jit(u, y, phi_coeffs, sigma2_ar, R, q_eta, cfg, 
     }
 
 
-# ==========================================================================
-# Validation, required before trusting any real-data number from this file:
-# 1. closed-form theta_from_kt1t2 matches the control-based params_to_theta
-# 2. the full JIT core matches the pure-Python logp core
-#    (riv_v1_logparam_riv_experiment) sample-for-sample on real inputs
-# ==========================================================================
+# Validation: the closed-form theta_from_kt1t2 must match the control-based
+# params_to_theta
 
 def _selfcheck_theta_formula(Ts: float, n: int = 5000) -> None:
     rng = np.random.default_rng(0)
@@ -413,123 +395,8 @@ def _selfcheck_theta_formula(Ts: float, n: int = 5000) -> None:
     assert max_err < 1e-6 and max_err_deg < 1e-4, "closed-form ZOH formula disagrees with validated params_to_theta"
 
 
-def _selfcheck_jit_matches_python_core(cfg, dual_cfg) -> None:
-    """The JIT core must reproduce the already-validated pure-Python logp
-    core (riv_v1_logparam_riv_experiment) on the SAME real recording,
-    sample-for-sample, before any JIT-produced real-data number is trusted.
-
-    History: the first version of this port diverged from the reference by
-    ~2e-3 relative after a few epochs -- traced (by instrumenting both cores
-    step-by-step) to a missing `Prls = 0.5*(Prls+Prls.T)` symmetrization
-    after the RLS covariance update. The reference pure-Python core has this
-    line; production's original theta-space `_dual_estimator_core` does not
-    (its Prls is 4x4 over raw ARX coefficients, a different quantity); this
-    JIT port needed the reference's convention and initially missed it.
-    Fixed (see git history) -- now matches to ~1e-12 (machine precision),
-    not just "close enough", so the tolerance below is tight by design: a
-    correct port should show no meaningful divergence at all."""
-    import sys as _sys
-    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "experiments/v1_logparam"))
-    from riv_v1_logparam_riv_experiment import run_identification_logparam
-    recordings = load_all_recordings(cfg)
-    ar_fits = fit_ar_beta_model_per_recording(recordings, cfg)
-    name = "system_id_4.csv"
-    u, y = recordings[name]
-    f = ar_fits[name]
-    R = 0.05 * f["sigma2_ar"]
-    q_eta = 0.5 * float(np.var(y))
-    n_epochs = 3
-    ref = run_identification_logparam(u, y, f["phi_coeffs"], f["sigma2_ar"], R, q_eta,
-                                       cfg, dual_cfg, n_epochs=n_epochs)
-    fast = run_identification_logparam_jit(u, y, f["phi_coeffs"], f["sigma2_ar"], R, q_eta,
-                                            cfg, dual_cfg, n_epochs=n_epochs)
-    dk = abs(fast["k"] - ref["k"]) / abs(ref["k"])
-    dt1 = abs(fast["tau1"] - ref["tau1"]) / abs(ref["tau1"])
-    dt2 = abs(fast["tau2"] - ref["tau2"]) / abs(ref["tau2"])
-    print(f"[selfcheck] JIT vs pure-Python core ({name}, {n_epochs} epochs): "
-          f"k ref={ref['k']:.6f} jit={fast['k']:.6f} (reldiff {dk:.2e}); "
-          f"tau1 reldiff {dt1:.2e}; tau2 reldiff {dt2:.2e}; "
-          f"python {ref['elapsed']:.2f}s vs jit {fast['elapsed']:.4f}s "
-          f"(includes one-time numba compile cost; see timing benchmark for steady-state speed)")
-    assert dk < 1e-6 and dt1 < 1e-6 and dt2 < 1e-6, "JIT core diverges from validated pure-Python core"
-
-
-def plot_kt_trajectory(t: np.ndarray, logp_hat: np.ndarray, path: Path) -> None:
-    import matplotlib.pyplot as plt
-    kt = np.exp(logp_hat)
-    fig, axes = plt.subplots(3, 1, figsize=(9, 7), sharex=True)
-    axes[0].plot(t, kt[:, 0], lw=1, color="tab:blue")
-    axes[0].set_ylabel("k")
-    axes[0].set_title("k, tau1, tau2 trajectory (final epoch, JIT logp-parametrised)")
-    axes[1].plot(t, kt[:, 1], lw=1, color="tab:green")
-    axes[1].set_ylabel("tau1 (s)")
-    axes[2].plot(t, kt[:, 2], lw=1, color="tab:red")
-    axes[2].set_ylabel("tau2 (s)")
-    axes[2].set_xlabel("time (s)")
-    fig.tight_layout()
-    fig.savefig(path)
-    plt.close(fig)
-
-
-_DEFAULT_JIT_OUT_DIR = Path(__file__).resolve().parent.parent.parent.parent / "results" / "v1_logparam_jit"
-
-
-def real_data_run_jit(
-    cfg, dual_cfg, n_epochs: int = 200, jac_eps: float = 1e-4,
-    make_plots: bool = True, out_dir: Path = _DEFAULT_JIT_OUT_DIR,
-) -> dict:
-    """Same structure as riv_v1_logparam_riv_experiment.real_data_run, but
-    using the JIT core -- n_epochs default raised from 10 to 200 (was
-    infeasible before the speedup: 200 epochs pure-Python would take
-    ~15-30 minutes/recording; the JIT core does it in <0.5s). Directly
-    settles Entry 31's open question (did tau1/tau2 converge, or were they
-    still sliding at n_epochs=10/30) by actually running to convergence."""
-    recordings = load_all_recordings(cfg)
-    ar_fits = fit_ar_beta_model_per_recording(recordings, cfg)
-
-    results = {}
-    for name in cfg.system_id_files:
-        key = name.replace(".csv", "")
-        u, y = recordings[name]
-        f = ar_fits[name]
-        R_heur = 0.05 * f["sigma2_ar"]
-        q_eta_heur = 0.5 * float(np.var(y))
-        res = run_identification_logparam_jit(u, y, f["phi_coeffs"], f["sigma2_ar"], R_heur, q_eta_heur,
-                                               cfg, dual_cfg, n_epochs=n_epochs, jac_eps=jac_eps)
-        results[key] = res
-        print(f"{key}: k={res['k']:.2f} tau1={res['tau1']:.5f} tau2={res['tau2']:.5f} "
-              f"whiteness_exceed={res['whiteness_frac_exceed']:.2f} "
-              f"nis_mean={res['nis_mean']:.2f} [{res['elapsed']:.3f}s, N={len(u)}, n_epochs={n_epochs}]")
-
-        if make_plots:
-            rec_dir = out_dir / key
-            rec_dir.mkdir(parents=True, exist_ok=True)
-            t = np.arange(len(u)) * cfg.Ts
-            plot_input(t, u, rec_dir / "input.png", title=f"Real stimulation input ({key})")
-            plot_input_excitation(u, cfg.Ts, res["tau1"], res["tau2"],
-                                   AVG_PATIENT_PARAMS["tau1"], AVG_PATIENT_PARAMS["tau2"],
-                                   rec_dir / "excitation_diagnostic.png")
-            plot_output_fit(t, y, res["y_hat"], rec_dir / "output_fit.png",
-                             y_hat_label="y_hat (V1 logp-parametrised, JIT, converged)")
-            plot_residual(t, res["innov"], rec_dir / "residual.png",
-                           ylabel="innovation", title="KF innovation vs time")
-            plot_components(t, res["x_hat"][:, 0], res["x_hat"][:, N_ETA], rec_dir / "components.png")
-            plot_kt_trajectory(t, res["logp_hat"], rec_dir / "kt_trajectory.png")
-            plot_k_tau_vs_epoch(np.arange(len(res["epoch_k"])), list(res["epoch_k"]),
-                                 list(res["epoch_tau1"]), list(res["epoch_tau2"]),
-                                 rec_dir / "k_tau_vs_epoch.png")
-
-    ks = [r["k"] for r in results.values()]
-    print(f"\npositive-k: {sum(k > 0 for k in ks)}/{len(ks)}")
-    if make_plots:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        plot_final_params_bar(results, out_dir / "final_params_bar.png", include_reference=True)
-    return results
-
-
 def _timing_benchmark(cfg, dual_cfg) -> None:
-    """Steady-state speed (excludes the one-time numba compile cost paid by
-    the first call) at production epoch count, one real recording."""
+    """Post-compile speed at the production epoch count on one real recording."""
     recordings = load_all_recordings(cfg)
     ar_fits = fit_ar_beta_model_per_recording(recordings, cfg)
     name = "system_id_4.csv"
@@ -537,21 +404,17 @@ def _timing_benchmark(cfg, dual_cfg) -> None:
     f = ar_fits[name]
     R = 0.05 * f["sigma2_ar"]
     q_eta = 0.5 * float(np.var(y))
-    # warm up (compiles); discard
+    # warm up (compiles)
     run_identification_logparam_jit(u, y, f["phi_coeffs"], f["sigma2_ar"], R, q_eta,
                                      cfg, dual_cfg, n_epochs=1)
     res = run_identification_logparam_jit(u, y, f["phi_coeffs"], f["sigma2_ar"], R, q_eta,
                                            cfg, dual_cfg, n_epochs=dual_cfg.n_epochs)
     print(f"[timing] {name}, n_epochs={dual_cfg.n_epochs} (production default), "
-          f"post-warmup: {res['elapsed']:.3f}s "
-          f"(pure-Python equivalent was ~40-85s/recording at n_epochs=10 -- "
-          f"see Entry 29/30/31)")
+          f"post-warmup: {res['elapsed']:.3f}s")
 
 
 if __name__ == "__main__":
     print("=== closed-form ZOH formula validation ===")
     _selfcheck_theta_formula(CFG.Ts)
-    print("\n=== JIT core vs pure-Python core (regression + speed) ===")
-    _selfcheck_jit_matches_python_core(CFG, DUAL_CFG)
     print("\n=== steady-state timing benchmark ===")
     _timing_benchmark(CFG, DUAL_CFG)

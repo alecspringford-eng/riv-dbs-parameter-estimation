@@ -1,17 +1,12 @@
-"""riv_single_pole_noise_calibration.py -- re-tune (q_off_frac, q_eta
-multiplier, R multiplier) for the single-pole estimator specifically.
+"""Re-tune (q_off_frac, q_eta multiplier, R multiplier) for the single-pole estimator.
 
-INVESTIGATION.md Entry 44: the single-pole model inherited these three
-noise constants unchanged from the two-pole DualConfig (q_off_frac=1e-2,
-q_eta=0.5*var(y), R=0.05*sigma2_ar), none re-derived for the single-pole
-model's own dynamics. The semi-synthetic gate failed (6.7% ok-rate, a1
-converging to the POLE_MAX clamp corner regardless of true tau) with a
-clean isolating-experiment signature pointing at the beta-disturbance/eta
-joint-observability confound, not PE order. This script does a truth-
-informed grid search (the same methodology DualConfig.q_off_frac's own
-docstring describes for the two-pole model: "Tuned by synthetic sweep") to
-find calibration values for which the single-pole model actually
-identifies (k, tau), before re-running the full semi-synthetic gate.
+The single-pole model inherited these constants unchanged from the two-pole
+DualConfig (q_off_frac=1e-2, q_eta=0.5*var(y), R=0.05*sigma2_ar). The
+semi-synthetic gate then failed (6.7% ok-rate, a1 converging to the POLE_MAX
+clamp corner regardless of true tau), pointing at the beta-disturbance/eta
+joint-observability confound rather than PE order. This runs a truth-informed
+grid search (the method DualConfig.q_off_frac describes) for values at which
+the single-pole model identifies (k, tau), before re-running the full gate.
 
 Does not modify riv_dual_estimation.py or riv_single_pole_estimation.py.
 """
@@ -32,9 +27,9 @@ from riv_mpc_param_export import PHI_AR_TRUE, SIGMA2_TRUE
 from riv_single_pole_estimation import AVG_PATIENT_PARAMS_1P
 from riv_single_pole_semisynth_check import generate_synthetic_iv_1p, run_1p_arm
 
-N_CAL = 1500          # shorter than the N_SYNTH=3000 gate recordings -- cheap search
-SEEDS_CAL = range(10)  # subset of the gate's N_SEEDS=30, for search speed only
-TAU_TRUTHS_CAL = (0.05, 0.15, 0.4)   # spans the gate's full tau grid
+N_CAL = 1500          # shorter than the gate's N_SYNTH=3000, for a cheap search
+SEEDS_CAL = range(10)  # subset of the gate's N_SEEDS=30
+TAU_TRUTHS_CAL = (0.05, 0.15, 0.4)   # spans the gate's tau grid
 K_TRUE_CAL = AVG_PATIENT_PARAMS_1P["k"]
 
 Q_OFF_FRAC_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 0.5)

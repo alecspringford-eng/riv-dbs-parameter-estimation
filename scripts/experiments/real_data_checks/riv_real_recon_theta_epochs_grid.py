@@ -1,22 +1,17 @@
-"""riv_real_recon_theta_epochs_grid.py -- same idea as
-riv_sampling_rate_theta_epochs_grid.py, but for the real-recon
-weighted-multisine signal: one small-multiples figure with every fs's
-EPOCH 0 trajectory side by side, one with every fs's FINAL epoch
-trajectory side by side, for direct comparison against the 3-tone
-signal's equivalent pair.
+"""Small-multiples grid of theta trajectories for the real-recon signal.
 
-Reuses collect()/FS_POINTS UNMODIFIED from riv_real_recon_theta_epochs_
-check.py (collect() already returns the raw per-fs arrays; that script's
-make_detailed_plot now just calls collect() then plots the per-fs stacked
-view -- this script reuses the same collect() for the grid view instead).
+As riv_sampling_rate_theta_epochs_grid.py, but for the real-recon weighted
+multisine: one figure with every fs's epoch-0 trajectory side by side and one
+with every fs's final-epoch trajectory, for comparison with the 3-tone signal.
+Reuses collect() and FS_POINTS from riv_real_recon_theta_epochs_check.py.
 
-Run: python3 scripts/riv_real_recon_theta_epochs_grid.py
+Run: python3 scripts/experiments/real_data_checks/riv_real_recon_theta_epochs_grid.py
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))  # repo root, for riv_* module imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))  # repo root
 
 import numpy as np
 import matplotlib
@@ -53,7 +48,7 @@ def plot_grid(runs: list[dict], key: str, title: str, path: Path) -> None:
 
 
 def main() -> None:
-    runs = [collect(fs) for fs in FS_POINTS]  # FS_POINTS already ascending
+    runs = [collect(fs) for fs in FS_POINTS]
 
     plot_grid(runs, "epoch0",
               "Epoch 0 parameter trajectories across fs (real-recon weighted-multisine, dotted=true)",

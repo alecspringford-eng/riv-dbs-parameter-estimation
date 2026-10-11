@@ -1,62 +1,8 @@
-"""riv_instrument_update_rate_experiment.py -- does the RIV auxiliary-model
-instrument (eta_aux) need to be refreshed from the online theta estimate
-every sample, or can it be updated less often -- down to fully offline
-(frozen at one fixed theta, precomputed once before the estimation loop
-starts at all)?
-
-Base scenario: the SAME faithful 2-pole port of the old prototype's
-"converging well" setup confirmed in INVESTIGATION.md Entry 47/48 (6/6 seeds
-ok) -- fs=50Hz (Ts=0.02), N_sim=80000, rate-limited multisine, no offset
-state, fixed AR(12) beta fallback, fixed noise constants (R=0.1, q_eta=1e4,
-q_beta_nominal=5.0, q_beta_other=0.1), init perturbed +-50% around the true
-(k,tau1,tau2)=(62.11,0.05,0.25). Every one of those constants is held
-IDENTICAL across every arm below -- only the instrument-update mechanism
-changes (per-user direction: this estimator is already tuned; retuning noise
-constants per-arm would confound "does update rate matter" with "did we
-compensate for it elsewhere").
-
-Reused, unmodified: params_to_theta / theta_to_params /
-theta_to_observer_canonical / simulate_ss / ar_to_state_space /
-build_process_noise_diag / _structured_kf_prop, all from this repo's own
-riv_dual_estimation.py. make_multisine_input / synthesize_ar_beta_fallback /
-simulate_ar_beta reused unmodified from riv_single_pole_50hz_replication_
-check.py (already a validated port of the same old-prototype scenario, and
-pole-count-agnostic). Ported (not modified in place) from the old prototype
-(".../RIV Kalman filter/riv_dual_estimation.py", read-only, per
-MPC_linear/CLAUDE.md): perturb_true_params, theta_to_discrete_ss,
-h2_model_error, and six plotting functions (plot_input, plot_output_fit,
-plot_eta_fit, plot_param_convergence, plot_theta_epochs_stacked,
-plot_theta_h2_epochs_stacked) -- so every arm below gets the SAME diagnostic
-plot suite the original "converging well" run produced, per user direction,
-not just a summary table.
-
-Instrument-update arms (one dial M = instrument refresh period in samples,
-plus an oracle check):
-  adaptive          M=1    (baseline, current production behaviour)
-  decimated_M{k}    M=k    (aux-model recursion still runs every sample, but
-                             the theta values it uses are a snapshot
-                             refreshed only every M samples)
-  decimated_Mfull   M=N    (snapshot refreshed once, at t=0, then never
-                             again -- cross-checked against frozen_init)
-  frozen_init              (aux model fixed at the perturbed INITIAL guess
-                             theta_hat0 for the whole run, eta_aux
-                             precomputed once, vectorized, before the KF/RLS
-                             loop starts -- the literal "fully offline" arm)
-  frozen_true               (same, but fixed at the TRUE theta -- oracle
-                             upper bound, isolates "offline is bad" from
-                             "this offline guess was bad")
-  lagged_u                  (classic delayed-input instrument, Entry 12 --
-                             zero plant-knowledge anchor, already implemented
-                             in riv_dual_estimation.py's dense reference)
-
-Run: python3 scripts/riv_instrument_update_rate_experiment.py
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 
-import control
 import numba
 import numpy as np
 import matplotlib
@@ -67,10 +13,15 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "estimators/v1"))
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "experiments/single_pole"))
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "experiments/real_data_checks"))
 from riv_dual_estimation import (
     params_to_theta, theta_to_params, theta_to_observer_canonical,
     simulate_ss, ar_to_state_space, build_process_noise_diag,
     _structured_kf_prop,
+)
+from riv_real_data_convergence_check import (
+    perturb_true_params, h2_model_error,
+    plot_theta_epochs_stacked, plot_theta_h2_epochs_stacked,
 )
 from riv_single_pole_50hz_replication_check import (
     make_multisine_input, synthesize_ar_beta_fallback, simulate_ar_beta,
@@ -108,33 +59,6 @@ class Config:
     p0_rls: float = 0.03
     p0_kf_state_var: float = 10.0
     n_epochs: int = 30
-
-
-# ==========================================================================
-# Ported verbatim from the old prototype (read-only source, Entry 47/48)
-# ==========================================================================
-
-def perturb_true_params(k: float, tau1: float, tau2: float, rng: np.random.Generator,
-                         frac: float) -> tuple[float, float, float]:
-    delta = rng.uniform(-frac, frac, size=3)
-    return k * (1 + delta[0]), tau1 * (1 + delta[1]), tau2 * (1 + delta[2])
-
-
-def theta_to_discrete_ss(theta: np.ndarray, Ts: float) -> control.StateSpace:
-    A_eta, B_eta, C_eta = theta_to_observer_canonical(theta)
-    return control.ss(A_eta, B_eta, C_eta, 0.0, dt=Ts)
-
-
-def h2_model_error(theta_true: np.ndarray, theta_hat: np.ndarray, Ts: float) -> float:
-    sys_err = theta_to_discrete_ss(theta_true, Ts) - theta_to_discrete_ss(theta_hat, Ts)
-    try:
-        val = control.norm(sys_err, p=2)
-        if np.isfinite(val):
-            return float(val)
-    except Exception:
-        pass
-    _, g = control.impulse_response(sys_err, T=np.arange(2000) * Ts)
-    return float(np.sqrt(np.sum(np.asarray(g).squeeze() ** 2)))
 
 
 def plot_input(t: np.ndarray, u: np.ndarray, cfg: Config, path: Path,
@@ -184,53 +108,6 @@ def plot_param_convergence(t: np.ndarray, theta_traj: np.ndarray, theta_true: np
     ax2.set_ylabel("H2 model error", color="tab:red")
     fig.tight_layout(); fig.savefig(path); plt.close(fig)
 
-
-def plot_theta_epochs_stacked(t: np.ndarray, epochs: list[int],
-                               theta_hat_by_epoch: dict[int, np.ndarray],
-                               theta_true: np.ndarray, path: Path) -> None:
-    fig, axes = plt.subplots(len(epochs), 1, figsize=(8, 2.6 * len(epochs)), sharex=True)
-    labels = ["a1", "a2", "b1", "b2"]
-    for row, epoch in enumerate(epochs):
-        ax = axes[row]
-        traj = theta_hat_by_epoch[epoch]
-        for i, lab in enumerate(labels):
-            ax.plot(t, traj[:, i], label=f"{lab}_hat", lw=1)
-            ax.axhline(theta_true[i], color=ax.lines[-1].get_color(), ls=":", lw=1)
-        ax.set_ylabel("theta_hat_k")
-        ax.set_title(f"epoch {epoch}")
-        if row == 0:
-            ax.legend(ncol=4, fontsize=8)
-    axes[-1].set_xlabel("time (s)")
-    fig.suptitle("Parameter trajectories across selected epochs (dotted = true)")
-    fig.tight_layout(); fig.savefig(path); plt.close(fig)
-
-
-def plot_theta_h2_epochs_stacked(t: np.ndarray, epochs: list[int],
-                                  theta_hat_by_epoch: dict[int, np.ndarray], theta_true: np.ndarray,
-                                  h2_t: np.ndarray, h2_err_by_epoch: dict[int, np.ndarray],
-                                  path: Path) -> None:
-    fig, axes = plt.subplots(len(epochs), 1, figsize=(8, 2.6 * len(epochs)), sharex=True)
-    for row, epoch in enumerate(epochs):
-        ax = axes[row]
-        traj = theta_hat_by_epoch[epoch]
-        err_norm = np.linalg.norm(traj - theta_true[None, :], axis=1)
-        ax.semilogy(t, err_norm, color="tab:blue", label="||theta_hat_k - theta_true||")
-        ax2 = ax.twinx()
-        ax2.semilogy(h2_t, h2_err_by_epoch[epoch], color="tab:red", marker="o", ms=3, lw=1,
-                     label="||G_true-G_hat||_H2")
-        ax.set_ylabel("||theta err||", color="tab:blue")
-        ax2.set_ylabel("H2 error", color="tab:red")
-        ax.set_title(f"epoch {epoch}")
-    axes[-1].set_xlabel("time (s)")
-    fig.suptitle("Error convergence across selected epochs")
-    fig.tight_layout(); fig.savefig(path); plt.close(fig)
-
-
-# ==========================================================================
-# Instrument-aware jitted core -- copy of the old prototype's
-# _dual_estimator_core (no clamp/no offset state, matching Entry 47's
-# faithful replication) with the z-update block replaced by a mode switch.
-# ==========================================================================
 
 @numba.njit(cache=True)
 def _dual_estimator_core_instrument(u, y, phi_ar, Q_diag, R, x0, P0_kf, theta0, P0_rls, lam,
@@ -392,9 +269,8 @@ def _dual_estimator_core_instrument(u, y, phi_ar, Q_diag, R, x0, P0_kf, theta0, 
 def run_dual_estimator_instrument(u, y, phi_ar, Q_diag, R, x0, P0_kf, theta0, P0_rls, lam,
                                    n_eta, p, instrument_mode, M, eta_aux_full,
                                    n_epochs=1, n_snapshots=0, save_epochs=None):
-    """Epoch-loop wrapper, same reset-each-epoch convention as this repo's
-    own run_dual_estimator (INVESTIGATION.md Entry 22: reset beats
-    carry-forward)."""
+    """Epoch-loop wrapper with the same reset-each-epoch convention as
+    run_dual_estimator (reset beat carry-forward)."""
     n = n_eta + p
     N = len(y)
     cov_stride = max(1, N // n_snapshots) if n_snapshots > 0 else 0
@@ -424,9 +300,7 @@ def run_dual_estimator_instrument(u, y, phi_ar, Q_diag, R, x0, P0_kf, theta0, P0
     return (x_hat, theta_hat, y_hat, Pkf_final, Prls_final, theta_epoch_hist, theta_hat_by_epoch)
 
 
-# ==========================================================================
-# Scenario generation (Entry 47's exact setup) + arms
-# ==========================================================================
+# Scenario generation + arms
 
 def make_scenario(cfg: Config, rng: np.random.Generator) -> dict:
     theta_true = params_to_theta(cfg.k_true, cfg.tau1_true, cfg.tau2_true, cfg.Ts)
@@ -446,7 +320,7 @@ def make_scenario(cfg: Config, rng: np.random.Generator) -> dict:
     A_beta, C_beta = ar_to_state_space(phi_coeffs)
     beta_sim = simulate_ar_beta(A_beta, C_beta, sigma2_ar, cfg.N_sim, rng)
     v = rng.normal(0.0, np.sqrt(cfg.R), size=cfg.N_sim)
-    y_true = beta_sim - eta_true + v  # NO offset term -- matches Entry 47 exactly
+    y_true = beta_sim - eta_true + v  # no offset term
 
     Q_diag = build_process_noise_diag(2, p, cfg.q_eta_default, cfg.q_beta_nominal,
                                        cfg.q_beta_other_default)
@@ -486,7 +360,7 @@ def run_arm_for_seed(arm: dict, cfg: Config, seed: int, save_epochs: set[int] | 
     elif arm["theta_source"] == "true":
         eta_aux_full = arm_eta_aux_full(scn["theta_true"], scn["u"])
     else:
-        eta_aux_full = np.zeros(cfg.N_sim)  # unused placeholder for this mode
+        eta_aux_full = np.zeros(cfg.N_sim)  # unused in this mode
 
     result = run_dual_estimator_instrument(
         scn["u"], scn["y_true"], scn["phi_c"], scn["Q_c"], cfg.R, scn["x0"], scn["P0_kf"],
@@ -496,9 +370,7 @@ def run_arm_for_seed(arm: dict, cfg: Config, seed: int, save_epochs: set[int] | 
     return scn, result
 
 
-# ==========================================================================
 # Per-arm ok-rate sweep + detailed (plotted) single-seed run
-# ==========================================================================
 
 def sweep_arm(arm: dict, cfg: Config, n_seeds: int = N_SEEDS) -> list[dict]:
     rows = []
@@ -580,7 +452,7 @@ def main() -> None:
 
     print(f"true (k,tau1,tau2)=({cfg.k_true},{cfg.tau1_true},{cfg.tau2_true}); "
           f"fs={cfg.fs}Hz N={cfg.N_sim}, no offset, fixed noise constants "
-          f"(Entry 47 replication base, {len(arms)} instrument-update arms, {N_SEEDS} seeds each)")
+          f"(an earlier experiment replication base, {len(arms)} instrument-update arms, {N_SEEDS} seeds each)")
 
     summary = []
     for arm in arms:
@@ -603,9 +475,8 @@ def main() -> None:
 
     plot_ok_rate_vs_M(summary, OUT_DIR / "ok_rate_vs_M.png")
 
-    # Cross-check: decimated(M=N_sim) and frozen_init are two different code
-    # paths (recursive-but-never-refreshed vs. precomputed-once-vectorized)
-    # that should compute the SAME thing -- verify they agree.
+    # Cross-check: decimated(M=N_sim) and frozen_init take different code paths
+    # (recursive vs precomputed) but should agree
     arm_dec_full = next(a for a in arms if a["name"] == "decimated_Mfull")
     arm_frozen_init = next(a for a in arms if a["name"] == "frozen_init")
     _, (_, theta_hat_a, *_rest_a) = run_arm_for_seed(arm_dec_full, cfg, seed=0)

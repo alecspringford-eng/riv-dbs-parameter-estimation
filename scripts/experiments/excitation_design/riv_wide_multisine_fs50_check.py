@@ -1,57 +1,40 @@
-"""riv_wide_multisine_fs50_check.py -- reruns the fs=50Hz, 10-seed "adaptive"
-arm baseline (INVESTIGATION.md Entry 50 / riv_sampling_rate_sweep_experiment.py)
-with the input excitation swapped from the current 3-tone rate-limited
-multisine to a 10-tone log-spaced "wide persistently exciting multisine",
-the same pattern already used for a different (single-pole) model in
-riv_single_pole_semisynth_check.py (there: geomspace(0.1,10,10) Hz, fixed,
-tuned for that script's own fs=25Hz/Ts=0.04s setup -- attributed to "the
-tutor's suggested method").
+"""Rerun of the fs=50Hz, 10-seed "adaptive" arm with a wide multisine input.
 
-Frequency scaling: the tutor's tones as a fraction of THEIR OWN Nyquist
-(12.5Hz) span geomspace(0.008, 0.8, 10) (0.8%-80% of Nyquist). This script
-preserves that log-spaced relative content but anchors it to cfg.fs's own
-Nyquist instead of the fixed 25Hz reference, so it doesn't alias at other
-sampling rates (see wide_multisine_freqs_hz). At fs=50Hz this gives tones
-at geomspace(0.2, 20, 10) Hz.
+The 3-tone rate-limited multisine of the baseline
+(riv_instrument_update_rate_experiment.py, riv_sampling_rate_sweep_experiment.py)
+is replaced by a 10-tone log-spaced multisine, the pattern used for the
+single-pole model in riv_single_pole_semisynth_check.py (geomspace(0.1, 10, 10)
+Hz at fs=25Hz, i.e. 0.8%-80% of Nyquist).
 
-Amplitude: reuses make_multisine's rescale-to-[lo,hi] behavior with
-lo=0, hi=cfg.u_max -- the same envelope as the current signal (NOT the
-single-pole script's U_LO/U_HI=(0.004,0.026), which is tuned for a
-different, unrelated real-data amplitude range).
+The tones keep that relative spacing but are anchored to cfg.fs's own
+Nyquist so they do not alias at other rates (see wide_multisine_freqs_hz); at
+fs=50Hz that is geomspace(0.2, 20, 10) Hz. Amplitude reuses make_multisine's
+rescale to [0, cfg.u_max], the same envelope as the current signal.
 
-Reused, unmodified (no source file below is edited in place): Config,
-AUX_DECIMATED, perturb_true_params, run_dual_estimator_instrument (all from
-riv_instrument_update_rate_experiment.py), synthesize_ar_beta_fallback,
-simulate_ar_beta (riv_single_pole_50hz_replication_check.py), make_multisine
+Reused unmodified: Config, AUX_DECIMATED, perturb_true_params and
+run_dual_estimator_instrument (riv_instrument_update_rate_experiment.py),
+synthesize_ar_beta_fallback and simulate_ar_beta
+(riv_single_pole_50hz_replication_check.py), make_multisine
 (riv_excitation_protocol_design_check.py), and the theta/state-space/AR
-helpers from riv_dual_estimation.py.
+helpers from riv_dual_estimation.py. make_scenario is not injectable, so
+make_scenario_wide duplicates riv_instrument_update_rate_experiment.make_scenario
+with only the input-generation line swapped.
 
-make_scenario itself is not parameterized/injectable, so make_scenario_wide
-below is a byte-for-byte duplicate of
-riv_instrument_update_rate_experiment.make_scenario (lines 427-456) with
-only the input-generation line swapped (marked inline).
+Caveat: the rng draws happen in the order perturb_true_params,
+synthesize_ar_beta_fallback, u generation (swap point), process noise,
+measurement noise. For the same seed, theta_true/theta_hat0/AR(12)
+coefficients are identical across old and new runs, but make_multisine draws
+one phase per tone (10 scalar calls vs one vectorized 3-draw call), which
+shifts the rng stream. The noise realizations therefore differ too, so this
+is valid for a median-over-10-seeds comparison but not a seed-by-seed diff.
 
-CAVEAT (not a bug, must be disclosed): make_scenario's rng draws happen in
-order (a) perturb_true_params, (b) synthesize_ar_beta_fallback, (c) u
-generation [swap point], (d) simulate_ar_beta's process noise, (e)
-measurement noise v. Steps (a)/(b) precede the swap, so for the same seed
-theta_true/theta_hat0/AR(12) coefficients are bit-identical between the
-old- and new-signal runs. But make_multisine draws one phase per tone via
-10 separate scalar rng.uniform() calls, vs. the original's single
-vectorized 3-draw call -- a different draw count that shifts the rng
-stream for everything after it. So beta_sim and v's noise realizations
-differ too, not just u. The two runs are therefore NOT a strict
-seed-paired ablation (noise realizations become independent draws, not
-matched pairs) -- valid for a median-over-10-seeds comparison, not for a
-seed-by-seed diff.
-
-Run: python3 scripts/riv_wide_multisine_fs50_check.py
+Run: python3 scripts/experiments/excitation_design/riv_wide_multisine_fs50_check.py
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))  # repo root, for riv_* module imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))  # repo root
 
 import numpy as np
 
@@ -72,11 +55,9 @@ from riv_instrument_update_rate_experiment import (
 )
 from riv_excitation_protocol_design_check import make_multisine
 
-# Tutor's wide multisine (riv_single_pole_semisynth_check.py) uses
-# geomspace(0.1, 10, 10) Hz at its own fs_ref=25Hz (Nyquist=12.5Hz).
-# As a fraction of THAT Nyquist: geomspace(0.1,10,10)/12.5 = geomspace(0.008, 0.8, 10)
-# -> 0.8%-80% of Nyquist, log-spaced, 10 tones. Anchor to whatever fs is in
-# play instead of the fixed 25Hz setup so it doesn't alias at low fs.
+# riv_single_pole_semisynth_check.py uses geomspace(0.1, 10, 10) Hz at fs_ref=25Hz
+# (Nyquist 12.5Hz), i.e. geomspace(0.008, 0.8, 10) of Nyquist. Scale that to the
+# current fs so it does not alias at low rates.
 _REL_FREQS = np.geomspace(0.008, 0.8, 10)
 
 
@@ -87,8 +68,7 @@ def wide_multisine_freqs_hz(fs: float) -> np.ndarray:
 
 
 def make_scenario_wide(cfg: Config, rng: np.random.Generator) -> dict:
-    """Duplicate of riv_instrument_update_rate_experiment.make_scenario
-    (lines 427-456), identical except the marked SWAP block."""
+    """riv_instrument_update_rate_experiment.make_scenario with the marked SWAP block changed."""
     theta_true = params_to_theta(cfg.k_true, cfg.tau1_true, cfg.tau2_true, cfg.Ts)
     k0, tau1_0, tau2_0 = perturb_true_params(cfg.k_true, cfg.tau1_true, cfg.tau2_true,
                                               rng, cfg.perturb_frac)
@@ -98,10 +78,9 @@ def make_scenario_wide(cfg: Config, rng: np.random.Generator) -> dict:
     p = len(phi_coeffs)
     n = 2 + p
 
-    # --- SWAP (was: u, freqs = make_multisine_input(cfg, rng)) ---
+    # SWAP (was: u, freqs = make_multisine_input(cfg, rng))
     freqs = wide_multisine_freqs_hz(cfg.fs)
     u = make_multisine(cfg.N_sim, 0.0, cfg.u_max, cfg.Ts, list(freqs), rng)
-    # --- end SWAP ---
 
     A_eta_t, B_eta_t, C_eta_t = theta_to_observer_canonical(theta_true)
     eta_true = simulate_ss(A_eta_t, B_eta_t, C_eta_t, u)
@@ -109,7 +88,7 @@ def make_scenario_wide(cfg: Config, rng: np.random.Generator) -> dict:
     A_beta, C_beta = ar_to_state_space(phi_coeffs)
     beta_sim = simulate_ar_beta(A_beta, C_beta, sigma2_ar, cfg.N_sim, rng)
     v = rng.normal(0.0, np.sqrt(cfg.R), size=cfg.N_sim)
-    y_true = beta_sim - eta_true + v  # NO offset term -- matches Entry 47 exactly
+    y_true = beta_sim - eta_true + v  # no offset term
 
     Q_diag = build_process_noise_diag(2, p, cfg.q_eta_default, cfg.q_beta_nominal,
                                        cfg.q_beta_other_default)
@@ -124,13 +103,11 @@ def make_scenario_wide(cfg: Config, rng: np.random.Generator) -> dict:
 
 
 def run_seed(cfg: Config, seed: int) -> dict:
-    """Mirrors sweep_arm's per-seed body (riv_instrument_update_rate_
-    experiment.py:499-519) for the fixed adaptive arm, with make_scenario_wide
-    in place of make_scenario. All run_dual_estimator_instrument arguments
-    match run_arm_for_seed's call exactly (n_snapshots=20, save_epochs=set())."""
+    """sweep_arm's per-seed body for the adaptive arm, using make_scenario_wide
+    (same run_dual_estimator_instrument arguments as run_arm_for_seed)."""
     rng = np.random.default_rng(seed)
     scn = make_scenario_wide(cfg, rng)
-    eta_aux_full = np.zeros(cfg.N_sim)  # unused placeholder, AUX_DECIMATED ignores it
+    eta_aux_full = np.zeros(cfg.N_sim)  # unused, AUX_DECIMATED ignores it
     x_hat, theta_hat, y_hat, Pkf_final, Prls_final, theta_epoch_hist, _ = run_dual_estimator_instrument(
         scn["u"], scn["y_true"], scn["phi_c"], scn["Q_c"], cfg.R, scn["x0"], scn["P0_kf"],
         scn["theta_hat0"], scn["P0_rls"], cfg.lambda_ff, 2, scn["p"],
@@ -151,10 +128,10 @@ def run_seed(cfg: Config, seed: int) -> dict:
 
 
 N_SEEDS = 10
-CFG = Config()  # fs=50Hz, Ts=0.02 -- identical anchor cfg to Entry 50
+CFG = Config()  # fs=50Hz, Ts=0.02
 
 BASELINE = dict(k_hat=62.125, tau1_hat=0.05094, tau2_hat=0.24423,
-                 ok_rate="10/10", theta_err=0.0344)  # Entry 50 / this-session rerun
+                 ok_rate="10/10", theta_err=0.0344)
 
 
 def main() -> None:
@@ -169,7 +146,7 @@ def main() -> None:
           f"tau2_hat={np.median([r['tau2_hat'] for r in rows]):.5f}  "
           f"ok_rate={n_ok}/{N_SEEDS}  "
           f"median_theta_err={np.median([r['theta_err'] for r in rows]):.4f}")
-    print(f"baseline (current 3-tone signal, Entry 50): {BASELINE}")
+    print(f"baseline (current 3-tone signal, an earlier experiment): {BASELINE}")
 
 
 if __name__ == "__main__":

@@ -1,20 +1,13 @@
-"""riv_mpc_param_export.py -- exports theta/logparam identification trajectories
-against a known-truth synthetic plant and the 6 real recordings, for
-MPC_linear's closed-loop parameterization comparison to consume.
+"""Exports theta/logparam identification trajectories against a known-truth
+synthetic plant and the 6 real recordings, for a downstream closed-loop MPC
+parameterization comparison.
 
-No changes to riv_dual_estimation.py or riv_v1_logparam_jit.py -- this file
-only calls their existing, unmodified public functions.
-
-This module implements the synthetic ground-truth generator, the
-theta-arm/logparam-arm estimator wrappers (Tasks 1-2), and the real-recordings
-arm + full export driver (Task 3) of the export plan.
+Only calls the existing public functions of riv_dual_estimation.py and
+riv_v1_logparam_jit.py.
 """
 from __future__ import annotations
-
 from pathlib import Path
-
 import numpy as np
-
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "estimators/v1"))
@@ -27,14 +20,10 @@ from riv_dual_estimation import (
 from riv_v1_logparam_jit import run_dual_estimator_logparam_jit
 
 N_SYNTH = 3000
-# 30, not the smaller values (4/6/10) used by some earlier one-off scripts in
-# this repo -- matches this repo's own resolved seed-count decision
-# (INVESTIGATION.md Entry 39: 6->30 to get a stable ok-rate estimate).
+# 30 seeds for a stable ok-rate estimate (earlier scripts used 4/6/10)
 N_SEEDS = 30
 OUT_DIR = Path(__file__).resolve().parent.parent.parent.parent / "results" / "mpc_param_export"
-# Disturbance (beta) truth used by the synthetic generator -- reproduces
-# riv_v1_logparam_riv_experiment.py's synthetic_selfcheck exactly, truth
-# parameterized instead of hardcoded.
+# Disturbance (beta) truth for the synthetic generator, as in synthetic_selfcheck
 PHI_AR_TRUE = np.array([0.6, -0.2, 0.1])
 SIGMA2_TRUE = 0.05
 C0_TRUE = 1.10
@@ -42,12 +31,8 @@ C0_TRUE = 1.10
 
 def generate_synthetic_iv(seed: int, k_true: float, tau1_true: float, tau2_true: float,
                            N: int = N_SYNTH) -> tuple[np.ndarray, np.ndarray]:
-    """Known-truth synthetic (u, y) pair: PRBS-like uniform u, ARX-simulated
-    eta from the truth plant, AR(3) beta random walk (fixed disturbance
-    truth). Same generator as synthetic_selfcheck in
-    riv_v1_logparam_riv_experiment.py, parameterized by (k_true, tau1_true,
-    tau2_true) instead of hardcoded, so it can also be run at
-    AVG_PATIENT_PARAMS."""
+    """Known-truth (u, y): uniform u, ARX-simulated eta, AR(3) beta. Parameterized
+    by (k_true, tau1_true, tau2_true)."""
     rng = np.random.default_rng(seed)
     u = rng.uniform(0.004, 0.026, size=N)
     eta_true = simulate_arx_recursion(params_to_theta(k_true, tau1_true, tau2_true, CFG.Ts), u)
@@ -66,18 +51,14 @@ def generate_synthetic_iv(seed: int, k_true: float, tau1_true: float, tau2_true:
 
 def run_theta_arm(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, sigma2_ar: float,
                    q_eta: float, cfg, dual_cfg, n_epochs_online: int = 1) -> dict:
-    """Runs the theta=[a1,a2,b1,b2] (ARX) dual estimator two ways on the same
-    (u, y): a full-convergence pass (dual_cfg.n_epochs epochs) for a single
-    "final" estimate, and a single causal pass (n_epochs_online, default 1)
-    to get the per-sample online (k, tau1, tau2) trajectory. Both go through
-    theta_to_params_physical to undo the u-normalization build_kf_setup
-    applies -- theta_hat/theta_epoch_hist from run_dual_estimator are in
-    u-normalized space.
+    """Run the theta=[a1,a2,b1,b2] dual estimator on (u, y): a full-convergence
+    pass (dual_cfg.n_epochs) for the final estimate and a single causal pass
+    (n_epochs_online) for the per-sample online (k, tau1, tau2) trajectory.
+    Both go through theta_to_params_physical to undo build_kf_setup's
+    u-normalization.
 
     phi_ar/sigma2_ar/q_eta are the disturbance-model AR coefficients,
-    innovation variance, and eta process-noise scale to use -- the synthetic
-    arm passes the known truth (PHI_AR_TRUE, SIGMA2_TRUE, 0.5*var(y)), the
-    real-recordings arm passes each recording's own fitted AR model."""
+    innovation variance and eta process-noise scale."""
     R = 0.05 * sigma2_ar
 
     setup = build_kf_setup(u, y, phi_ar, sigma2_ar, q_eta, cfg, dual_cfg)
@@ -95,11 +76,9 @@ def run_theta_arm(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, sigma2_ar: f
         )
         return theta_hat
 
-    # Once-per-episode: full n_epochs convergence (dual_cfg.n_epochs, default 30).
     theta_hat_conv = run_pass(dual_cfg.n_epochs)
     k_f, tau1_f, tau2_f = theta_to_params_physical(theta_hat_conv[-1], u_scale, cfg.Ts)
 
-    # Online: single causal pass (n_epochs=1), per-sample trajectory.
     theta_hat_online = run_pass(n_epochs_online)
     N = len(u)
     k_on = np.empty(N)
@@ -117,22 +96,13 @@ def run_theta_arm(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, sigma2_ar: f
 
 def run_logparam_arm(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, sigma2_ar: float,
                       q_eta: float, cfg, dual_cfg, n_epochs_online: int = 1) -> dict:
-    """Runs the logparam=[log k, log tau1, log tau2] dual estimator two ways
-    on the same (u, y): a full-convergence pass (dual_cfg.n_epochs epochs)
-    for a single "final" estimate, and a single causal pass (n_epochs_online,
-    default 1) to get the per-sample online (k, tau1, tau2) trajectory.
-    Unlike theta's path, logp_hat is already in physical (Ts-independent)
-    log-space -- np.exp() is the only conversion needed, no u-scale
-    correction (build_kf_setup's u-normalization only affects the ARX
-    regression the logparam Jacobian is linearized around, not the reported
-    parameters). P0_rls here is 3x3 (log k, log tau1, log tau2), not
-    build_kf_setup's 4x4 theta-space P0_rls -- mirrors
-    riv_v1_logparam_jit.run_identification_logparam_jit's own setup.
+    """Run the logparam=[log k, log tau1, log tau2] dual estimator on (u, y),
+    with the same full-convergence and online passes as run_theta_arm.
+    logp_hat is already in physical log-space, so np.exp() is the only
+    conversion needed. P0_rls is 3x3 here, not build_kf_setup's 4x4.
 
     phi_ar/sigma2_ar/q_eta are the disturbance-model AR coefficients,
-    innovation variance, and eta process-noise scale to use -- the synthetic
-    arm passes the known truth (PHI_AR_TRUE, SIGMA2_TRUE, 0.5*var(y)), the
-    real-recordings arm passes each recording's own fitted AR model."""
+    innovation variance and eta process-noise scale."""
     R = 0.05 * sigma2_ar
 
     setup = build_kf_setup(u, y, phi_ar, sigma2_ar, q_eta, cfg, dual_cfg)
@@ -152,14 +122,12 @@ def run_logparam_arm(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, sigma2_ar
         )
         return logp_hat
 
-    # Once-per-episode: full n_epochs convergence (dual_cfg.n_epochs, default 30).
     logp_hat_conv = run_pass(dual_cfg.n_epochs)
     logp_final = logp_hat_conv[-1]
     k_f = float(np.exp(logp_final[0]))
     tau1_f = float(np.exp(logp_final[1]))
     tau2_f = float(np.exp(logp_final[2]))
 
-    # Online: single causal pass (n_epochs=1), per-sample trajectory.
     logp_hat_online = run_pass(n_epochs_online)
     k_on = np.exp(logp_hat_online[:, 0])
     tau1_on = np.exp(logp_hat_online[:, 1])
@@ -173,10 +141,8 @@ def run_logparam_arm(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, sigma2_ar
 
 
 def export_synthetic(n_seeds: int = N_SEEDS, N: int = N_SYNTH, out_dir: Path = OUT_DIR) -> Path:
-    """Runs both estimator arms on n_seeds known-truth synthetic (u, y)
-    realizations (fixed AVG_PATIENT_PARAMS truth, PHI_AR_TRUE/SIGMA2_TRUE
-    disturbance truth), and saves per-seed final + online-trajectory
-    estimates to out_dir/synthetic_params.npz."""
+    """Run both arms on n_seeds synthetic realizations (AVG_PATIENT_PARAMS
+    truth) and save final and online estimates to out_dir/synthetic_params.npz."""
     out_dir.mkdir(parents=True, exist_ok=True)
     k_true = AVG_PATIENT_PARAMS["k"]
     tau1_true = AVG_PATIENT_PARAMS["tau1"]
@@ -222,19 +188,11 @@ def export_synthetic(n_seeds: int = N_SEEDS, N: int = N_SYNTH, out_dir: Path = O
 
 
 def export_real(out_dir: Path = OUT_DIR) -> Path:
-    """Runs both estimator arms once (full-convergence only -- no online
-    trajectory) on each of the 6 real system_id recordings, each against the
-    SAME pooled AR beta disturbance model (fit across every recording's
-    no-stimulation periods together, not the synthetic truth), and saves
-    the once-per-episode estimates to out_dir/real_params.npz.
-
-    This is the design's secondary/caveat arm: real-data numbers here are
-    confounded by known identifiability pathologies in both
-    parameterizations (documented elsewhere in this repo) -- it is not the
-    driver of the "online" cadence comparison, which uses the controlled
-    synthetic arm. `ok`/status is not computed here (no known truth to check
-    against for real recordings); every recording's estimate is reported,
-    none silently dropped."""
+    """Run both arms once (full convergence only) on each of the 6 real
+    recordings against one pooled AR beta model, and save the estimates to
+    out_dir/real_params.npz. No ok/status is computed (no known truth), and
+    no recording is dropped. Real-data numbers are confounded by the
+    identifiability problems documented in the methods doc."""
     out_dir.mkdir(parents=True, exist_ok=True)
     recordings = load_all_recordings(CFG)
     _, phi_coeffs, sigma2_ar = fit_ar_beta_model_pooled(recordings, CFG)
@@ -247,9 +205,6 @@ def export_real(out_dir: Path = OUT_DIR) -> Path:
 
     for name in names:
         u, y = recordings[name]
-        # pooled AR fit + innovation variance (not the synthetic
-        # PHI_AR_TRUE/SIGMA2_TRUE, and not a per-recording fit) drive R and
-        # the KF disturbance model, shared across every recording.
         th = run_theta_arm(u, y, phi_coeffs, sigma2_ar, q_eta_global, CFG, DUAL_CFG)
         lp = run_logparam_arm(u, y, phi_coeffs, sigma2_ar, q_eta_global, CFG, DUAL_CFG)
         print(f"{name}: theta k={th['k_final']:.2f}  logparam k={lp['k_final']:.2f}")

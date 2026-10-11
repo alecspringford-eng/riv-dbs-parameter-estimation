@@ -1,29 +1,19 @@
-"""
-Experiment: does V1 recover k on a "semi-synthetic" construction -- eta from
-the KNOWN, exactly-assumed 2-lag ARX plant (same as the S4.8 fully-synthetic
-self-check in riv_dual_estimation.py), but beta built from a moving-block
-bootstrap of the recording's OWN real no-stim segments (the same pool
-fit_ar_beta_model_per_recording uses) instead of an AR(p) draw?
+"""Does V1 recover k on a semi-synthetic construction?
 
-Isolates one variable against the existing fully-synthetic control: beta's
-generative process (parametric AR(p) draw vs a nonparametric resample of
-genuine real no-stim samples, which carries whatever non-AR structure --
-periodicity, non-Gaussianity, anything an AR(p) fit discards -- real beta
-actually has). eta/plant and offset stay exactly as assumed in both cases.
+eta comes from the known 2-lag ARX plant (as in the S4.8 fully-synthetic
+self-check in riv_dual_estimation.py), but beta is a moving-block bootstrap of
+the recording's own no-stim segments (the pool fit_ar_beta_model_per_recording
+uses) instead of an AR(p) draw. That isolates beta's generative process
+against the fully-synthetic control: the bootstrap keeps whatever non-AR
+structure (periodicity, non-Gaussianity) real beta has.
 
-If semi-synthetic recovers k about as well as fully-synthetic: the
-synthetic-vs-real gap is NOT explained by beta's real (non-AR) statistics,
-and the real-data failure must come from the eta/plant side (the true
-physiological response isn't the assumed linear 2-lag ARX, or beta/eta are
-confounded beyond a DC offset).
+If semi-synthetic recovers k about as well as fully-synthetic, real beta's
+non-AR statistics do not explain the real-data gap, and the cause is on the
+eta/plant side. If it fails about as badly as real data, beta's own
+statistics break the KF/RIV separation regardless of the plant, pointing at
+the disturbance model or architecture.
 
-If semi-synthetic fails about as badly as fully real: real beta's own
-statistics (independent of any AR misfit) are sufficient to break the
-KF/RIV separation regardless of whether the plant is exactly the assumed
-one -- points the fix at the disturbance/noise model or architecture
-(V3's joint estimation), not at plant richness.
-
-main() is untouched -- report only. See INVESTIGATION.md Entry 15.
+Report only; main() is untouched.
 """
 import contextlib
 import io
@@ -46,10 +36,10 @@ MEAS_NOISE_STD = 0.02
 
 def moving_block_bootstrap(segments: list[np.ndarray], n_samples: int, block_len: int,
                             rng: np.random.Generator) -> np.ndarray:
-    """Nonparametric real-beta surrogate: concatenate randomly-placed,
-    possibly-overlapping blocks of length block_len drawn with replacement
-    from the pooled real segments until n_samples is reached. Preserves real
-    beta's short-range statistics without imposing an AR(p) functional form."""
+    """Concatenate randomly placed, possibly overlapping blocks of length
+    block_len drawn with replacement from the pooled real segments until
+    n_samples is reached. Keeps real beta's short-range statistics without
+    imposing an AR(p) form."""
     pool = np.concatenate(segments)
     block_len = min(block_len, len(pool))
     chunks, total = [], 0
@@ -110,7 +100,7 @@ def main() -> None:
         for seed in range(N_SEEDS):
             rng = np.random.default_rng(seed)
             with contextlib.redirect_stdout(io.StringIO()):
-                # fully-synthetic control: AR(fit) draw, same phi/sigma2 as semi-synthetic
+                # fully-synthetic control: AR(fit) draw
                 A_beta, C_beta = R.ar_to_state_space(fit["phi_coeffs"])
                 p = len(fit["phi_coeffs"])
                 xb = np.zeros(p)
@@ -126,7 +116,7 @@ def main() -> None:
                 k_fs.append(res_fs["k"]); white_fs.append(res_fs["whiteness_frac_exceed"])
                 nis_fs.append(res_fs["nis_mean"])
 
-                # semi-synthetic: real beta via moving-block bootstrap of real no-stim data
+                # semi-synthetic: moving-block bootstrap of real no-stim data
                 beta_bb = moving_block_bootstrap(segments, N, BLOCK_LEN, rng)
                 y_ss = c0 + beta_bb - eta_true + rng.normal(0, MEAS_NOISE_STD, N)
                 res_ss = R.run_identification(u, y_ss, fit["phi_coeffs"], fit["sigma2_ar"],

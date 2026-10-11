@@ -1,64 +1,4 @@
-"""riv_real_data_convergence_check.py -- semisynthetic convergence check,
-built to exactly match the structure of the OneDrive reference
-riv_dual_estimation.py's run_scenario("realistic_ar_beta", ...) suite
-(Personal_Code/Linear-models/RIV Kalman filter/riv_dual_estimation.py):
-known theta_true (AVG_PATIENT_PARAMS), a perturbed initial guess
-(perturb_true_params), a beta disturbance simulated from an AR(p) model
-fit in the LOG domain (unconditionally, like the OneDrive script -- not
-this repo's ar_log_domain=False default), y = beta_true - eta_true + v
-with no baseline/offset term, and a bare KF+RIV core with NO offset
-state, NO per-step pole/gain clamping, and NO u-normalization -- none of
-which existed in the OneDrive script.
 
-The only two things that differ from the OneDrive scenario: the
-stimulation input u is this repo's real per-recording u (not a
-synthetic PRBS/multisine), and the beta AR(p) model is fit pooled
-across every recording's no-stimulation segments together (one
-consensus model shared by all 6 recordings, not a single
-beta_causal_RMS.csv/stimulation.csv pair, and not a per-recording fit
-either -- riv_dual_estimation.py's main() and riv_mpc_param_export.py's
-export_real() were switched to the same pooled fit for consistency).
-
-Deliberately does NOT reuse riv_dual_estimation.py's build_kf_setup /
-_dual_estimator_core / run_dual_estimator: that estimator has since
-picked up an offset state and unconditional theta clamping (real-data
-fixes, see PHASE4/PHASE6/PHASE8 reports) that the OneDrive script never
-had, and touching that shared, already-validated code for this one
-experiment would risk the main real-data pipeline's results. This file
-ports the OneDrive numba core standalone instead -- no changes to
-riv_dual_estimation.py.
-
-P0_RLS / P0_KF_STATE_VAR / LAMBDA_FF / N_EPOCHS / perturb_frac below are the
-OneDrive script's DualConfig/Config defaults, carried over verbatim. The
-b1,b2 prior variance (P0_B in run_semisynthetic_recording, 0.5 not
-OneDrive's flat P0_RLS=0.03) is retuned: this repo's real stimulation
-amplitude is ~150-400x smaller than OneDrive's own synthetic PRBS, which
-starves b1,b2 of per-step excitation under OneDrive's gain as-is.
-u-normalizing to fix this was tried and confirmed to be an exact no-op on
-the physical-unit trajectory once done dimensionally consistently -- it's
-a similarity transform, not a real fix (see run_semisynthetic_recording's
-comment).
-
-R / q_eta / q_beta_nominal / q_beta_other are NOT OneDrive-verbatim (they
-were originally, at R=0.1/Q_ETA_DEFAULT=1e4/Q_BETA_NOMINAL=5.0/
-Q_BETA_OTHER_DEFAULT=0.1 -- tuned for OneDrive's own u/y amplitude, ~100-
-600x larger than this repo's real data). INVESTIGATION.md Entry 43 found
-that mismatch causes two effects: a systematic bias in the well-
-conditioned (data-determined) b1+b2 combination (Exp 0: well-conditioned-
-direction error was LARGER than the ill-conditioned one on all 6
-recordings -- the opposite of what pure input collinearity alone would
-predict), and outright numerical instability once P0_B is loosened enough
-to search harder for b1/b2 separation (Exp 3: >100x blow-ups at P0_B>=1-2
-on several recordings). Retuning only P0_B (as before) left this
-unaddressed. These four are now computed data-drivenly in main(), reusing
-riv_dual_estimation.py's own already-validated heuristic exactly
-(R=0.05*sigma2_ar, q_eta=0.5*var(pooled y), and build_process_noise_diag's
-q_beta_nominal=sigma2_ar/q_beta_other=0.1*sigma2_ar split) rather than
-inventing a new formula -- that heuristic's NIS/whiteness behavior is
-already characterized in RESEARCH_NOTEBOOK.md's Key assumptions (A6).
-
-Run: python3 scripts/riv_real_data_convergence_check.py
-"""
 from __future__ import annotations
 
 import time
@@ -82,8 +22,8 @@ from riv_dual_estimation import (
 
 OUT_DIR = Path(__file__).resolve().parent.parent.parent.parent / "results" / "real_data_convergence_check"
 
-# OneDrive DualConfig defaults, ported verbatim (repo's own DUAL_CFG has since
-# diverged: p0_rls=0.3 not 0.03, plus an offset/clamping-era Q_diag scheme).
+# reference DualConfig defaults, ported verbatim (this repo's DUAL_CFG has diverged:
+# p0_rls=0.3 not 0.03, plus an offset/clamping-era Q_diag scheme)
 LAMBDA_FF = 0.9999
 P0_RLS = 0.03
 P0_KF_STATE_VAR = 10.0
@@ -91,15 +31,11 @@ N_EPOCHS = 30
 H2_EVAL_POINTS = 150
 PERTURB_FRAC = 150
 
-# R / q_eta / q_beta_nominal / q_beta_other are NOT constants -- computed
-# data-drivenly in main() (see module docstring) and threaded through as
-# explicit parameters below, since they depend on the pooled AR fit's
-# sigma2_ar and the generated semisynthetic y, both only known at runtime.
+# R / q_eta / q_beta_nominal / q_beta_other are computed in main() (see module
+# docstring) and passed as parameters, since they depend on runtime values
 
 
-# ==========================================================================
-# Perturbed initial guess (OneDrive's perturb_true_params, verbatim)
-# ==========================================================================
+# Perturbed initial guess (reference's perturb_true_params, verbatim)
 
 def perturb_true_params(k: float, tau1: float, tau2: float, rng: np.random.Generator,
                          frac: float) -> tuple[float, float, float]:
@@ -107,9 +43,7 @@ def perturb_true_params(k: float, tau1: float, tau2: float, rng: np.random.Gener
     return k * (1 + delta[0]), tau1 * (1 + delta[1]), tau2 * (1 + delta[2])
 
 
-# ==========================================================================
-# H2 model error (OneDrive's h2_model_error, verbatim)
-# ==========================================================================
+# H2 model error (reference's h2_model_error, verbatim)
 
 def theta_to_discrete_ss(theta: np.ndarray, Ts: float) -> control.StateSpace:
     A_eta, B_eta, C_eta = theta_to_observer_canonical(theta)
@@ -129,12 +63,9 @@ def h2_model_error(theta_true: np.ndarray, theta_hat: np.ndarray, Ts: float) -> 
 
 
 def nll_innovations(innov: np.ndarray, S: np.ndarray) -> float:
-    """Gaussian one-step-ahead prediction-error NLL, same formula as
-    riv_dual_estimation.py's _v1_forward_kf_nll -- used here to pick P0_B
-    from the data itself (innovations, predicted variance), not from
-    theta_true. Unlike that function this is evaluated post-hoc on the
-    dual estimator's own KF innovations, at whatever theta the RIV epochs
-    converged to, not with theta held fixed."""
+    """Gaussian one-step-ahead prediction-error NLL, used to pick P0_B from the
+    data rather than theta_true. Evaluated post-hoc on the dual estimator's own
+    KF innovations at the converged theta, not with theta held fixed."""
     return float(0.5 * np.sum(innov ** 2 / S + np.log(2 * np.pi * S)))
 
 
@@ -151,12 +82,9 @@ def simulate_ar_beta(A_beta: np.ndarray, C_beta: np.ndarray, sigma2: float,
     return beta_sim
 
 
-# ==========================================================================
-# Bare KF+RIV core -- standalone port of the OneDrive script's
-# _structured_kf_prop / _dual_estimator_core / run_dual_estimator: no offset
-# state, no per-step clamping, no u-normalization. Kept separate from
-# riv_dual_estimation.py's (offset-state, clamped) core on purpose.
-# ==========================================================================
+# Bare KF+RIV core, a standalone port of the reference _structured_kf_prop /
+# _dual_estimator_core / run_dual_estimator (no offset state, clamping or
+# u-normalization), kept separate from riv_dual_estimation.py's core
 
 @numba.njit(cache=True)
 def _structured_kf_prop(P: np.ndarray, Q_diag: np.ndarray, phi_ar: np.ndarray,
@@ -383,9 +311,7 @@ def run_dual_estimator(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, Q_diag:
             theta_epoch_hist, theta_hat_by_epoch, elapsed, innov_hist, S_hist)
 
 
-# ==========================================================================
-# Plotting suite (same 6 plots as before)
-# ==========================================================================
+# Plotting suite
 
 def plot_input(t, u, path, title="Real stimulation input") -> None:
     fig, ax = plt.subplots(figsize=(9, 3))
@@ -471,17 +397,14 @@ def plot_theta_h2_epochs_stacked(t, epochs, theta_hat_by_epoch, theta_true,
     fig.tight_layout(); fig.savefig(path); plt.close(fig)
 
 
-# ==========================================================================
 # Semisynthetic generator + per-recording driver
-# ==========================================================================
 
 def generate_semisynthetic(u_real: np.ndarray, phi_coeffs: np.ndarray, sigma2_ar: float,
                             theta_true: np.ndarray, rng: np.random.Generator, R: float
                             ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """y = beta_true - eta_true + v, no baseline/offset term -- same as
-    OneDrive's generate_true_data(idealised=False). beta_true is a log-domain
-    AR fluctuation (mean 0, since the segments it was fit from were
-    detrended), not exponentiated back to linear beta power."""
+    """y = beta_true - eta_true + v with no offset term, as in the reference's
+    generate_true_data(idealised=False). beta_true is a zero-mean log-domain AR
+    fluctuation, not exponentiated back to linear power."""
     N = len(u_real)
     eta_true = simulate_arx_recursion(theta_true, u_real)
     A_beta, C_beta = ar_to_state_space(phi_coeffs)
@@ -506,20 +429,6 @@ def calibrate_p0_b(fit_inputs: list[tuple[np.ndarray, np.ndarray, np.ndarray, np
                     q_beta_other: float,
                     grid: tuple[float, ...] = (0.001, 0.003, 0.01, 0.03, 0.1, 0.2, 0.5,
                                                 1.0, 2.0, 5.0)) -> float:
-    """Pick P0_B (the b1,b2 RLS prior variance) by minimizing total one-step-
-    ahead prediction-error NLL across all recordings, at each candidate's
-    final-epoch estimate -- uses only (u,y) and the estimator's own
-    innovations, never theta_true. This replaces picking P0_B by minimizing
-    ||theta_hat-theta_true|| directly, which is circular (theta_true is
-    exactly what a blind pipeline would not have to tune against).
-
-    Recordings that diverge at EVERY grid value are excluded from the sum
-    and reported separately, rather than silently poisoning every
-    candidate's score (or, worse, leaving best_p0b at whatever grid[0]
-    happens to be when nothing is finite -- that was a real bug here: it
-    reported a "selected" P0_B even when its NLL was inf). A recording that
-    diverges at some candidates but not others still counts normally --
-    that's real information the calibration should use."""
     print("\ncalibrating P0_B against innovation NLL (truth-blind, not theta_true)...")
     finite = np.zeros((len(fit_inputs), len(grid)), dtype=bool)
     nll = np.full((len(fit_inputs), len(grid)), np.nan)
@@ -565,7 +474,7 @@ def run_semisynthetic_recording(name: str, u_real: np.ndarray, y: np.ndarray, ph
                                  theta_true: np.ndarray, theta_hat0: np.ndarray, p0_b: float,
                                  R: float, q_eta: float, q_beta_nominal: float, q_beta_other: float,
                                  cfg, out_dir: Path) -> dict:
-    print(f"\n=== {name} (semisynthetic, OneDrive structure: real u, "
+    print(f"\n=== {name} (semisynthetic, reference structure: real u, "
           f"log-domain real-fitted beta AR model, P0_B={p0_b} calibrated truth-blind) ===")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -582,11 +491,8 @@ def run_semisynthetic_recording(name: str, u_real: np.ndarray, y: np.ndarray, ph
         u_real, y, phi_c, Q_c, R, x0, P0_kf, theta_hat0, P0_rls, LAMBDA_FF, N_ETA, p,
         n_epochs=n_epochs, n_snapshots=20, save_epochs=set(selected_epochs))
 
-    # theta_true is used below only to EVALUATE the already-fit trajectory
-    # (this is a semisynthetic ground-truth study, that's the point) -- it
-    # was not used to pick p0_b or to pick which epoch counts as "the"
-    # result, which is decided by epoch count alone (what a blind pipeline
-    # actually delivers), not by cherry-picking the epoch closest to truth.
+    # theta_true is used below only to evaluate the fit; it does not pick p0_b or
+    # the reported epoch (decided by epoch count alone)
     epoch_errs = np.linalg.norm(theta_epoch_hist - theta_true[None, :], axis=1)
     print(f"epoch-to-epoch parameter error ({name}):")
     for epoch in np.unique(np.linspace(0, n_epochs - 1, min(6, n_epochs)).astype(int)):
@@ -636,34 +542,27 @@ def run_semisynthetic_recording(name: str, u_real: np.ndarray, y: np.ndarray, ph
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     recordings = load_all_recordings(CFG)
-    cfg_log = replace(CFG, ar_log_domain=True)  # force log domain, local override only
-    # Pooled across every recording's no-stimulation periods -- one consensus
-    # AR model shared by all recordings (not a per-recording fit anymore, so
-    # no donor-borrowing for recordings with no no-stim data of their own).
+    cfg_log = replace(CFG, ar_log_domain=True)  # local override
+    # Pooled across every recording's no-stim periods: one AR model shared by all
     ar_order, phi_coeffs, sigma2_ar = fit_ar_beta_model_pooled(recordings, cfg_log)
     print(f"pooled AR({ar_order}) sigma2_ar={sigma2_ar:.4e}")
 
-    # R / q_beta_nominal / q_beta_other are data-driven (INVESTIGATION.md
-    # Entry 43), reusing riv_dual_estimation.py's own validated heuristic
-    # exactly rather than OneDrive's amplitude-mismatched verbatim constants
-    # (R=0.1, Q_BETA_NOMINAL=5.0, Q_BETA_OTHER_DEFAULT=0.1). q_eta is set
-    # below, once the semisynthetic y is generated with this R (mirrors
-    # production main()'s q_eta=0.5*var(y_all_system_id), pooled across all
-    # recordings, not per-recording).
+    # R / q_beta_nominal / q_beta_other use riv_dual_estimation.py's heuristic rather
+    # than the reference's amplitude-mismatched constants. q_eta is set below, once
+    # the semisynthetic y exists (0.5*var(y_all_system_id), pooled as in main())
     R = 0.05 * sigma2_ar
     q_beta_nominal = sigma2_ar
     q_beta_other = 0.1 * sigma2_ar
     print(f"data-driven R={R:.4e}, q_beta_nominal={q_beta_nominal:.4e}, "
-          f"q_beta_other={q_beta_other:.4e} (was OneDrive-verbatim R=0.1, "
+          f"q_beta_other={q_beta_other:.4e} (was reference-verbatim R=0.1, "
           f"Q_BETA_NOMINAL=5.0, Q_BETA_OTHER_DEFAULT=0.1 -- see module docstring)")
 
     theta_true = params_to_theta(AVG_PATIENT_PARAMS["k"], AVG_PATIENT_PARAMS["tau1"],
                                   AVG_PATIENT_PARAMS["tau2"], CFG.Ts)
     print(f"theta_true = {np.array2string(theta_true, precision=5)}")
 
-    # Generate each recording's semisynthetic y and perturbed initial guess
-    # once, up front, so the P0_B calibration below and the final run see
-    # the exact same data/guess -- not independently re-randomized.
+    # Generate each recording's semisynthetic y and initial guess once, so the P0_B
+    # calibration and the final run see the same data
     per_recording = {}
     for idx, name in enumerate(CFG.system_id_files):
         u_real, _ = recordings[name]
@@ -680,7 +579,7 @@ def main() -> None:
 
     q_eta = 0.5 * float(np.var(np.concatenate([per_recording[name][1]
                                                 for name in CFG.system_id_files])))
-    print(f"data-driven q_eta={q_eta:.4e} (pooled var(y), was OneDrive-verbatim "
+    print(f"data-driven q_eta={q_eta:.4e} (pooled var(y), was reference-verbatim "
           f"Q_ETA_DEFAULT=1e4)")
 
     p0_b = calibrate_p0_b([per_recording[name] for name in CFG.system_id_files],

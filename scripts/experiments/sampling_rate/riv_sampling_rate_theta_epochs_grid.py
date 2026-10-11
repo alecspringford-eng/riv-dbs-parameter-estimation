@@ -1,23 +1,21 @@
-"""riv_sampling_rate_theta_epochs_grid.py -- two comparison figures for the
-current 3-tone signal's fs sweep (same FS_POINTS grid as
-riv_sampling_rate_theta_epochs_check.py): one small-multiples grid with
-every fs's EPOCH 0 parameter trajectory side by side, one with every fs's
-FINAL epoch (29) trajectory side by side -- so the fs-to-fs progression is
-visible in one glance instead of paging through 10 separate stacked plots.
+"""Small-multiples comparison of theta trajectories across the 3-tone fs sweep.
 
-Reuses rate_mod.run_arm_for_seed UNMODIFIED (riv_instrument_update_rate_
-experiment.py:476-492) to get the raw theta_hat_by_epoch/theta_true arrays
-directly (run_arm_detailed itself only saves plots, doesn't return data).
-Reuses ADAPTIVE_ARM/cfg_at_fs/FS_POINTS from riv_sampling_rate_
-theta_epochs_check.py unmodified -- same fs grid, same seed=0 convention.
+Two figures over the FS_POINTS grid of riv_sampling_rate_theta_epochs_check.py:
+every fs's epoch-0 trajectory side by side, and every fs's final-epoch (29)
+trajectory side by side.
 
-Run: python3 scripts/riv_sampling_rate_theta_epochs_grid.py
+Uses rate_mod.run_arm_for_seed (riv_instrument_update_rate_experiment.py) to
+get the raw theta_hat_by_epoch/theta_true arrays, since run_arm_detailed only
+saves plots, plus ADAPTIVE_ARM / cfg_at_fs / FS_POINTS from
+riv_sampling_rate_theta_epochs_check.py (seed=0).
+
+Run: python3 scripts/experiments/sampling_rate/riv_sampling_rate_theta_epochs_grid.py
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))  # repo root, for riv_* module imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))  # repo root
 
 import numpy as np
 import matplotlib
@@ -74,7 +72,7 @@ def plot_grid(runs: list[dict], key: str, title: str, path: Path) -> None:
 
 
 def main() -> None:
-    runs = [collect(fs) for fs in FS_POINTS]  # FS_POINTS already ascending
+    runs = [collect(fs) for fs in FS_POINTS]
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     plot_grid(runs, "epoch0", "Epoch 0 parameter trajectories across fs (3-tone signal, dotted=true)",

@@ -1,24 +1,16 @@
-"""
-Derive an AR disturbance-model order/shape from a richer external dataset,
-for the whiteness investigation (see INVESTIGATION.md, RESEARCH_NOTEBOOK.md).
+"""Derive an AR disturbance-model order/shape from a richer external dataset.
 
-Our own no-stim data is too thin to test whiteness meaningfully: 3/6
-system_id recordings have zero usable no-stim segments, the rest have one
-125-sample segment -- at that sample size the whiteness test has ~zero
-statistical power (order 3 through 15 all trivially "pass" with
-frac_exceed=0.000, see INVESTIGATION.md Entry 10).
+Our own no-stim data is too thin for a whiteness test: 3/6 system_id
+recordings have no usable no-stim segment and the rest have one 125-sample
+segment, so every order from 3 to 15 trivially passes (frac_exceed=0.000).
 
-External data: a DIFFERENT recording (nndbsProject, 50 Hz, different
-session/subject than real_recordings's 25 Hz), with 4 true zero-stim
-segments of 5000-11000 samples each -- real statistical power. This script
-fits the AR order/shape on that data, downsamples exactly to our 25 Hz via
-resample_ar_model (matrix-square, no approximation), and caches the result
-to external_ar_model.npz so production code never needs the external .mat file.
+The external recording (nndbsProject, 50 Hz, a different session/subject)
+has 4 zero-stim segments of 5000-11000 samples. The AR order/shape is fit on
+it, downsampled exactly to 25 Hz with resample_ar_model, and cached to
+external_ar_model.npz so production code never needs the .mat file.
 
-NOTE: this is a cross-dataset structural probe, not a claim the two
-recordings share identical physiology -- flagged throughout downstream use.
-Re-run this script only if the source .mat file changes; the cache is what
-everything else reads.
+This is a cross-dataset structural probe, not a claim that the two
+recordings share physiology. Re-run only if the source .mat file changes.
 """
 import os
 from pathlib import Path
@@ -31,12 +23,11 @@ from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "estimators/v1"))
 import riv_dual_estimation as R
 
-# Path to the external .mat file, supplied by the user -- not included in this
-# repo. Set via the EXTERNAL_AR_MAT env var, or edit the fallback below.
+# External .mat file (not included in this repo): set EXTERNAL_AR_MAT or edit the fallback
 EXTERNAL_MAT = Path(os.environ.get("EXTERNAL_AR_MAT", "external_data/dbs_segments.mat"))
 CACHE_PATH = Path(__file__).parent / "external_ar_model.npz"
 EXTERNAL_TS = 0.02  # 50 Hz
-TRIM_SAMPLES = 250  # 5s @ 50Hz, matches the source study's own trim convention
+TRIM_SAMPLES = 250  # 5s @ 50Hz, the source study's trim
 ORDER_MIN, ORDER_MAX = 1, 20
 
 
@@ -62,7 +53,7 @@ def main() -> None:
           f"({total_samples * EXTERNAL_TS:.1f}s)")
 
     order, phi_50hz, sigma2_50hz = R._select_consensus_ar(cleaned, ORDER_MIN, ORDER_MAX, verbose=True)
-    stable_50, eig_50 = R.ar_stability_check(phi_50hz)
+    stable_50, _ = R.ar_stability_check(phi_50hz)
     print(f"external AR({order}) @50Hz: stable={stable_50}, sigma2={sigma2_50hz:.4e}")
     assert stable_50, "external AR fit is unstable -- do not cache"
 

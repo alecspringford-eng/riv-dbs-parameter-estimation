@@ -1,33 +1,16 @@
-"""
-Dual estimator (Kalman filter + recursive Instrumental-Variable RLS) for
-joint state and parameter estimation of the DBS beta-suppression model.
-
-Real-data pipeline: the plant (k, tau1, tau2) is identified directly from
-real stimulation/beta recordings (real_recordings/<delay_dir>/), and
-the beta AR disturbance model is fit from the pooled no-stimulation periods
-across every recording. There is no synthetic "true" plant here -- only a
-data-driven initial guess that the dual estimator refines epoch by epoch.
-
-Run: python3 scripts/riv_dual_estimation.py
-"""
 
 from __future__ import annotations
-
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-
 import control
 import numba
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize
+from scipy.linalg import toeplitz
 
-
-# ==========================================================================
-# 0. Config
-# ==========================================================================
+# Config
 
 @dataclass(frozen=True)
 class Config:
@@ -37,29 +20,18 @@ class Config:
 
     # Real recordings
     data_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent.parent.parent.parent / "real_recordings")
-    # ponytail: two delay-compensated alignments are available (delay_5,
-    # delay_6) with no basis in this pipeline to prefer one -- defaulting to
-    # delay_5; switch cfg.delay_dir if the other alignment is known correct.
     delay_dir: str = "delay_5"
     system_id_files: tuple[str, ...] = (
         "system_id_1.csv", "system_id_2.csv", "system_id_3.csv",
         "system_id_4.csv", "system_id_5.csv", "system_id_long_run.csv",
     )
     controller_files: tuple[str, ...] = ("simple_controllers_1.csv", "simple_controllers_2.csv")
-    # ponytail: 15% above the observed device floor -- separates genuine
-    # "stim off" samples from the next PRBS amplitude level up; raise if a
-    # recording's off-floor drifts higher than that.
     stim_off_tol_frac: float = 1.15
 
     # Beta AR(p) disturbance model (fit from pooled no-stim real data)
     settle_time_s: float = 5.0
     seg_ar_order_min: int = 3
     seg_ar_order_max: int = 10
-    # D1 fix: fit the beta AR model in the LINEAR output domain (the domain the
-    # Kalman filter operates in), not log. Phase 2 showed the log-domain fit put
-    # the beta pole ~37% off and mis-scaled Q_beta; refitting linearly cut the
-    # real-data k scatter (max k 388->84). Set True only to reproduce the old
-    # log-domain behaviour.
     ar_log_domain: bool = False
 
     # Data / output paths
@@ -69,78 +41,27 @@ class Config:
 
 @dataclass(frozen=True)
 class DualConfig:
-    """Dual-estimator (KF+RIV) tuning knobs, chosen empirically against the
-    real per-recording system_id sequences (2745-6120 samples/pass):
-    lambda_ff closer to 1 than 0.999 avoids P_rls growing by (1/lambda)**N
-    each pass (verified: 0.999 caused epoch-to-epoch theta to blow up on a
-    longer, now-removed concatenated run; kept at the safer 0.9999 here too).
-    n_epochs=300: each recording is much shorter than the old concatenated
-    run, so more passes are needed per file to settle (verified: some
-    recordings, e.g. system_id_long_run, are still drifting slightly at
-    300 -- short single recordings are inherently harder to fully converge
-    on than the pooled AR data)."""
+    """Dual-estimator (KF+RIV) tuning knobs. lambda_ff=0.9999: at 0.999 P_rls
+    grows by (1/lambda)**N per pass and theta blew up. n_epochs=300: single
+    recordings are short, so more passes are needed; some (e.g.
+    system_id_long_run) still drift slightly at 300."""
     lambda_ff: float = 0.9999
     p0_rls: float = 0.3
     p0_kf_state_var: float = 10.0
     n_epochs: int = 30
-    # Offset (baseline) state: process-noise variance as a fraction of var(y).
-    # Small -> the offset tracks only the slow beta DC baseline, leaving fast
-    # fluctuation to beta/eta. This state is the real-data negative-k fix.
-    # Tuned by synthetic sweep (median |k err| + positive-k fraction): 1e-2 gives
-    # the most positive-k without letting the offset absorb u-driven suppression
-    # (>=1 regresses to negative). See PHASE6_TUNING_REPORT.md.
     q_off_frac: float = 1e-2
-    # Pole-regularisation leak (opt-in, default OFF): pulls a1,a2 toward prior
-    # poles each step. Tested in Phase 8 and REJECTED -- anchoring to the
-    # avg-patient prior (a1_prior=1.30, near the unit-sum region) pushes poles
-    # toward the clamp corner and makes k *worse*. Kept available (verified) but
-    # 0 by default. See PHASE8_V1_FURTHER_TUNING.md.
     gamma_pole: float = 0.0
-    # ponytail: unvalidated heuristic threshold for epoch_convergence_check --
-    # a numeric companion to the existing k_tau_vs_epoch plot, not itself tuned
-    # against any ground truth. Tighten/loosen if it flags recordings the plot
-    # visually shows as settled/unsettled.
     epoch_converge_rtol: float = 1e-3
 
 
 CFG = Config()
 DUAL_CFG = DualConfig()
-
-N_ETA = 2
-N_THETA = 4
-
-# Average-patient reference plant (literature/prior, not fit from this
-# data) -- the RIV estimator is initialized here rather than from a batch
-# LS fit, since the only estimator in this script is the recursive IV one.
 AVG_PATIENT_PARAMS = {"k": 62.11, "tau1": 0.05, "tau2": 0.25}
-
-# Shared ceiling for the eta-recursion's real poles (project_stable_real_poles
-# and _clamp_pole_pair below). 0.95 <-> tau~0.8s at Ts=0.04s. Originally 0.99
-# (tau~4s), but a pole that close to 1 makes the DC-gain k=(b1+b2)/(1-a1-a2)
-# divide by a near-zero denominator: on real data this let k's sign/magnitude
-# swing wildly on tiny fit noise even though eta_hat itself tracked u with
-# the physically correct (positive) sign -- verified by direct correlation.
 POLE_MAX = 0.95
-
-# Safety ceiling on the RIV update's b1,b2 (u-normalized-input gain terms).
-# _clamp_pole_pair only bounds a1,a2 -- b1,b2 have no such constraint, and
-# whenever a1,a2 sits at the clamp corner the RIV instrument (z1,z2, which
-# is itself propagated forward using b1,b2 each step) goes ill-conditioned
-# there and b1,b2 can explode to ~1e18 in a couple of epochs, after which
-# the blown-up z1,z2 keeps every later step unstable too (verified: this is
-# what made 3/6 recordings diverge under the avg-patient initial guess,
-# which visits that corner far more than the old batch-LS warm start did).
-# 10.0 is generous headroom over every converged fit seen so far (b1,b2 in
-# u-normalized space have stayed under ~1) -- it's a runaway breaker, not a
-# tuned physical bound.
 B_MAX = 10.0
+N_ETA = 2
 
-
-# ==========================================================================
-# 1. Plant model math: continuous plant -> discrete ARX -> observer-canonical
-#    (kept for the self-consistency checks and for theta<->(k,tau1,tau2)
-#    conversion; there is no "true" plant for real data, only these helpers)
-# ==========================================================================
+# Plant model math: continuous plant -> discrete ARX -> observer-canonical
 
 def build_true_ss(k: float, tau1: float, tau2: float) -> control.StateSpace:
     Ac = np.array([[-1 / tau1, 0.0],
@@ -176,9 +97,7 @@ def params_to_theta(k: float, tau1: float, tau2: float, Ts: float) -> np.ndarray
 
 
 def theta_to_params(theta: np.ndarray, Ts: float) -> tuple[float, float, float]:
-    """Analytic inverse of params_to_theta: recovers (k, tau1, tau2) from
-    theta=[a1,a2,b1,b2]. Poles solve the discrete characteristic polynomial
-    z^2-a1*z-a2=0, tau=-Ts/log(z)"""
+    """Inverse of params_to_theta: poles solve z^2-a1*z-a2=0, tau=-Ts/log(z)."""
     a1, a2, b1, b2 = theta
     poles = np.roots([1.0, -a1, -a2])
 
@@ -229,10 +148,8 @@ def simulate_arx_recursion(theta: np.ndarray, u: np.ndarray) -> np.ndarray:
 
 
 def run_self_consistency_checks(cfg: Config) -> None:
-    """ARX recursion == forced_response == observer-canonical simulation,
-    and theta's poles == analytic ZOH poles, for an arbitrary but
-    physically-plausible test plant. This checks the math only -- it has
-    no bearing on the real-data parameter estimates."""
+    """ARX recursion == forced_response == observer-canonical simulation, and
+    theta's poles == analytic ZOH poles, for a plausible test plant."""
     k_test, tau1_test, tau2_test = 60.0, 0.05, 0.25
     sys_c = build_true_ss(k_test, tau1_test, tau2_test)
     sys_d = discretize_zoh(sys_c, cfg.Ts)
@@ -261,9 +178,7 @@ def run_self_consistency_checks(cfg: Config) -> None:
     print("[4.1] Self-consistency checks passed (ARX/state-space/observer-canonical/poles).")
 
 
-# ==========================================================================
-# 2. Real recordings + beta AR(p) disturbance model pooled across all of them
-# ==========================================================================
+# Real recordings + pooled beta AR(p) disturbance model
 
 def load_recording(path: Path) -> tuple[np.ndarray, np.ndarray]:
     df = pd.read_csv(path)
@@ -289,10 +204,9 @@ def compute_epsilon_floor(beta: np.ndarray) -> float:
 
 def clean_beta_segments(beta_log: np.ndarray, segments: list[tuple[int, int]],
                          trim_samples: int, min_len: int) -> list[np.ndarray]:
-    """Per segment: drop the first/last `trim_samples` (stim-transition
-    transients) if enough data remain, then detrend by subtracting the
-    (trimmed) segment mean. Segments still shorter than `min_len` after
-    trimming are dropped -- too little data for a stable AR fit."""
+    """Per segment: trim `trim_samples` from each end (stim-transition transients)
+    if enough data remain, then subtract the mean. Segments shorter than
+    `min_len` are dropped."""
     cleaned = []
     for s, e in segments:
         seg = beta_log[s:e]
@@ -328,6 +242,20 @@ def aic_score(sigma2: float, order: int, n: int) -> float:
 ACF_MAX_LAG = 20
 WHITENESS_CI = 1.96
 WHITENESS_FAIL_FRAC = 0.05
+
+
+def pe_order_check(u: np.ndarray, order: int, rel_eig_floor: float = 1e-2) -> dict:
+    """u is PE of `order` iff the order x order Toeplitz sample-autocovariance
+    matrix is positive definite. rel_eig_floor is a practical near-singularity
+    guard (real data is rarely exactly singular), not a validated statistical
+    threshold."""
+    n = len(u)
+    ru = np.array([np.dot(u[:n - lag], u[lag:]) / n for lag in range(order)])
+    eigs = np.linalg.eigvalsh(toeplitz(ru))
+    min_eig, max_eig = float(eigs.min()), float(eigs.max())
+    return {"order": order, "min_eig": min_eig, "max_eig": max_eig,
+            "cond": max_eig / max(min_eig, 1e-300), "ru0": float(ru[0]),
+            "is_pe": bool(min_eig > rel_eig_floor * ru[0])}
 
 
 def residual_whiteness_test(resid: np.ndarray) -> tuple[bool, float]:
@@ -391,12 +319,6 @@ def _select_consensus_ar(segments: list[np.ndarray], order_min: int, order_max: 
 
 def fit_ar_beta_model_pooled(recordings: dict[str, tuple[np.ndarray, np.ndarray]],
                               cfg: Config) -> tuple[int, np.ndarray, float]:
-    """Beta disturbance-model pipeline, pooled over every recording's
-    no-stimulation periods: log-transform (one epsilon floor shared across
-    all recordings), per-recording no-stim segment detection, per-segment
-    trim+detrend, per-segment AR order selection (AIC + residual
-    whiteness), then one final pooled refit at the consensus (median)
-    order using every recording's cleaned segments together."""
     all_outputs = np.concatenate([y for _, y in recordings.values()])
     epsilon = compute_epsilon_floor(all_outputs)
     thresh = min(u.min() for u, _ in recordings.values()) * cfg.stim_off_tol_frac
@@ -423,9 +345,9 @@ def fit_ar_beta_model_pooled(recordings: dict[str, tuple[np.ndarray, np.ndarray]
 def _find_ar_donor(name: str, seg_pool: dict[str, list[np.ndarray]],
                     system_id_files: tuple[str, ...],
                     controller_files: tuple[str, ...]) -> tuple[list[np.ndarray], str]:
-    """Borrow no-stim segments for a recording with none of its own, from the
-    nearest other system_id recording (by filename-index adjacency) that has
-    usable segments; simple_controllers recordings are a last-resort tier."""
+    """Borrow no-stim segments for a recording with none, from the nearest
+    system_id recording (by filename index) that has some; simple_controllers
+    recordings are the last resort."""
     idx = system_id_files.index(name)
     candidates = sorted((p for p in range(len(system_id_files)) if p != idx),
                          key=lambda p: (abs(p - idx), p))
@@ -442,10 +364,6 @@ def _find_ar_donor(name: str, seg_pool: dict[str, list[np.ndarray]],
 def fit_ar_beta_model_per_recording(
     recordings: dict[str, tuple[np.ndarray, np.ndarray]], cfg: Config
 ) -> dict[str, dict]:
-    """Per-recording beta AR(p) disturbance model: each system_id recording
-    is fit on its own no-stim segments; a recording with no usable segments
-    of its own borrows them from the nearest other recording that has some
-    (see _find_ar_donor)."""
     all_outputs = np.concatenate([y for _, y in recordings.values()])
     epsilon = compute_epsilon_floor(all_outputs)
     thresh = min(u.min() for u, _ in recordings.values()) * cfg.stim_off_tol_frac
@@ -479,8 +397,6 @@ def fit_ar_beta_model_per_recording(
 
 
 def ar_to_state_space(phi_coeffs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Companion form. State ordering x_beta=[beta_k,...,beta_{k-p+1}],
-    C_beta=[1,0,...,0]."""
     p = len(phi_coeffs)
     A_beta = np.zeros((p, p))
     A_beta[0, :] = phi_coeffs
@@ -492,60 +408,24 @@ def ar_to_state_space(phi_coeffs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def ar_stability_check(phi_coeffs: np.ndarray) -> tuple[bool, np.ndarray]:
-    """Eigenvalues of the AR(p) companion matrix == characteristic-polynomial
-    roots; stable iff all |eigenvalue| < 1. An unstable beta disturbance
-    model would make the KF's beta sub-state diverge."""
     A_beta, _ = ar_to_state_space(phi_coeffs)
     eigvals = np.linalg.eigvals(A_beta)
     return bool(np.all(np.abs(eigvals) < 1.0)), eigvals
 
 
 def resample_ar_model(phi_coeffs: np.ndarray, factor: int) -> np.ndarray:
-    """Exact resampling of a discrete-time AR(p) model to `factor`x the
-    original sampling period (e.g. factor=2 to go from 50 Hz to 25 Hz).
-
-    If x_{k+1} = A x_k (companion form), observing every `factor`-th sample
-    is exactly x_{k+factor} = A^factor x_k -- the new transition matrix is a
-    matrix power of the original, no approximation. A companion matrix's
-    characteristic polynomial IS the AR polynomial, so the new AR(p)
-    coefficients are recovered from the characteristic polynomial of
-    A^factor (its eigenvalues are exactly the original eigenvalues raised to
-    `factor`). Verified numerically: eig(A^factor) == eig(ar_to_state_space(
-    resample_ar_model(phi, factor))[0]) to 1e-8, for complex conjugate pairs
-    too. Process-noise variance is NOT handled here -- propagate Q
-    separately (Q_new = A Q A^T + Q for factor=2, generalizes to a sum over
-    factor steps) since this codebase's Q is a diagonal approximation, not
-    the exact companion-form noise covariance."""
     A_old, _ = ar_to_state_space(phi_coeffs)
     A_new = np.linalg.matrix_power(A_old, factor)
     charpoly = np.poly(np.linalg.eigvals(A_new))
     return (-charpoly[1:]).real
 
 
-# ==========================================================================
-# 3. Pole-projection helpers (initial guess is the average-patient prior via
-#    params_to_theta; these exist only as a reporting-time safety net -- the
-#    per-step clamp in the RIV core keeps theta in this family already)
-# ==========================================================================
+# Pole-projection helpers: a reporting-time safety net, since the per-step
+# clamp in the RIV core already keeps theta in this family
 
 def project_stable_real_poles(a1: float, a2: float) -> tuple[float, float]:
-    """Project (a1,a2) onto a stable, two-*positive*-real-pole cascade: the
-    plant is physically two first-order lags in series (poles=exp(-Ts/tau),
-    always in (0,1)), but an unconstrained ARX(2,2) fit on noisy real data
-    routinely lands on complex, negative, or unstable poles. Complex/negative
-    poles are replaced by two distinct positive real poles at the same
-    natural magnitude (critically-damped approximation); anything outside
-    the unit circle is then clipped back in. Used both to seed a physically
-    valid initial guess and, where the recursive fit's poles fall outside
-    this family, as a nearest-valid-cascade reading for reporting."""
     poles = np.roots([1.0, -a1, -a2])
     if np.any(np.abs(poles.imag) > 1e-9) or np.any(poles.real <= 0):
-        # ponytail: split into (mag, mag**2) rather than a fixed +-5%/10%
-        # spread -- a fixed spread saturates against the clip ceiling for
-        # any near-unit dominant pole, collapsing every such fit onto the
-        # same (tau1,tau2) and erasing real per-recording differences
-        # (verified: every complex/negative-pole file mapped to the same
-        # projected tau1/tau2 with the old fixed-ratio version).
         mag = float(np.clip(np.abs(poles[0]), 0.3, POLE_MAX))
         poles = np.array([mag, mag ** 2])
     else:
@@ -554,9 +434,8 @@ def project_stable_real_poles(a1: float, a2: float) -> tuple[float, float]:
 
 
 def theta_to_params_safe(theta: np.ndarray, Ts: float) -> tuple[float, float, float]:
-    """theta_to_params, falling back to the nearest valid two-positive-
-    real-pole cascade (see project_stable_real_poles) if the recursive
-    estimator's current theta doesn't fall in that family."""
+    """theta_to_params, falling back to project_stable_real_poles if theta is not a
+    two-positive-real-pole cascade."""
     try:
         return theta_to_params(theta, Ts)
     except ValueError:
@@ -564,9 +443,7 @@ def theta_to_params_safe(theta: np.ndarray, Ts: float) -> tuple[float, float, fl
         return theta_to_params(np.array([a1_new, a2_new, theta[2], theta[3]]), Ts)
 
 
-# ==========================================================================
-# 4. Dual estimator core
-# ==========================================================================
+# Dual estimator core
 
 def build_process_noise_diag(n_eta: int, p_beta: int, q_eta: float,
                               q_beta_nominal: float, q_beta_other: float) -> np.ndarray:
@@ -578,15 +455,6 @@ def build_process_noise_diag(n_eta: int, p_beta: int, q_eta: float,
 
 @numba.njit(cache=True)
 def _clamp_pole_pair(a1: float, a2: float) -> tuple[float, float]:
-    """Project the eta-recursion's (a1,a2) back onto a valid two-real-
-    positive-pole cascade after every RIV update, not just at reporting
-    time. Without this, the a1,a2 sub-map has a marginal-stability
-    attractor at a1->0, a2->1 (poles -> +1,-1) for this real, weakly
-    exciting data -- verified: theta drifted there smoothly over dozens of
-    epochs, then bounced unpredictably on crossing the real/complex-pole
-    boundary, which is what made epoch-end (k,tau1,tau2) look random.
-    Clamping every step keeps the walk inside the physical region so it
-    can no longer approach that boundary at all."""
     pole_min = 1e-3
     pole_max = POLE_MAX
     disc = a1 * a1 + 4.0 * a2
@@ -609,8 +477,7 @@ def _clamp_pole_pair(a1: float, a2: float) -> tuple[float, float]:
 
 @numba.njit(cache=True)
 def _clamp_theta(a1: float, a2: float, b1: float, b2: float) -> tuple[float, float, float, float]:
-    """_clamp_pole_pair for (a1,a2), plus a magnitude ceiling on b1,b2 --
-    see B_MAX above for why b1,b2 need their own guard."""
+    """_clamp_pole_pair for (a1,a2) plus a ceiling on b1,b2 (see B_MAX)."""
     a1, a2 = _clamp_pole_pair(a1, a2)
     if b1 > B_MAX:
         b1 = B_MAX
@@ -627,10 +494,6 @@ def _clamp_theta(a1: float, a2: float, b1: float, b2: float) -> tuple[float, flo
 def _structured_kf_prop(P: np.ndarray, Q_diag: np.ndarray, phi_ar: np.ndarray,
                          a1: float, a2: float, n_eta: int, p: int, n_off: int,
                          temp: np.ndarray, Pminus: np.ndarray) -> None:
-    # n_off (0 or 1): optional constant/slow-drift offset state appended last,
-    # dynamics = identity (A_off = 1). It gives the beta DC baseline its own
-    # degree of freedom so it stops being absorbed by the stim-response eta --
-    # the root cause of the real-data negative-k failure (see run_identification).
     idx_beta = n_eta
     idx_off = n_eta + p
     n = n_eta + p + n_off
@@ -726,7 +589,7 @@ def _dual_estimator_core(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, Q_dia
             for m in range(1, p):
                 x_new[idx_beta + m] = x[idx_beta + m - 1]
             if n_off == 1:
-                x_new[idx_off] = x[idx_off]          # constant/slow-drift offset
+                x_new[idx_off] = x[idx_off]
             for i in range(n):
                 x[i] = x_new[i]
 
@@ -736,8 +599,7 @@ def _dual_estimator_core(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, Q_dia
                     Pkf[i, j] = Pminus[i, j]
 
         # scalar KF measurement update. H = [-1,0,...,1(@beta),...,+1(@off)]:
-        # y = beta - eta + offset. The offset carries the beta DC baseline so it
-        # no longer leaks into eta.
+        # y = beta - eta + offset
         off = x[idx_off] if n_off == 1 else 0.0
         h_pred = x[idx_beta] - x[0] + off
         innov = y[kk] - h_pred
@@ -780,9 +642,6 @@ def _dual_estimator_core(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, Q_dia
         phi_vec[2] = u_km1
         phi_vec[3] = u_km2
 
-        # Instrument z_k=[eta_aux_{k-1},eta_aux_{k-2},u_{k-1},u_{k-2}]: eta_aux
-        # is a noise-free simulation (updated below using pre-update theta),
-        # uncorrelated with the colored disturbance leaking into eta_hat.
         z_vec[0] = z1
         z_vec[1] = z2
         z_vec[2] = u_km1
@@ -805,8 +664,7 @@ def _dual_estimator_core(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, Q_dia
             pred += phi_vec[i] * theta[i]
         err = eta_hat_k - pred
 
-        # extend the auxiliary/instrument simulation one step using the
-        # (still pre-update) theta, before theta itself gets updated below
+        # extend the instrument simulation with the pre-update theta
         z_new = theta[0] * z1 + theta[1] * z2 + theta[2] * u_km1 + theta[3] * u_km2
         z2 = z1
         z1 = z_new
@@ -814,11 +672,6 @@ def _dual_estimator_core(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, Q_dia
         for i in range(4):
             theta[i] = theta[i] + Krls[i] * err
         theta[0], theta[1], theta[2], theta[3] = _clamp_theta(theta[0], theta[1], theta[2], theta[3])
-        # Prior-regularised (leaky) RIV on the POLE coefficients only: pull a1,a2
-        # a fraction gamma_pole toward the physical prior each step. The pole
-        # directions are weakly excited / confounded (Phase 4) and otherwise
-        # drift to the clamp-corner attractor where (1-a1-a2)->0 blows k up; the
-        # gain b1,b2 stays free to fit the data. gamma_pole=0 -> original RIV.
         if gamma_pole > 0.0:
             theta[0] += gamma_pole * (a1_prior - theta[0])
             theta[1] += gamma_pole * (a2_prior - theta[1])
@@ -874,12 +727,8 @@ def run_dual_estimator(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, Q_diag:
     x_hat = theta_hat = y_hat = Pkf_final = Prls_final = innov_final = S_final = None
     t0 = time.perf_counter()
     for epoch in range(n_epochs):
-        # reuse the seeded initial state every epoch (all zeros except any offset
-        # seed) rather than zeroing -- keeps the baseline seed across epochs.
-        # (Carrying x forward across epochs instead was tried and measured
-        # WORSE on the S4.8 synthetic ground-truth check -- 30-seed comparison,
-        # 7/30 ok (reset) vs 5/30 ok (carry-forward), median err 0.883 vs 1.064
-        # -- reverted. See INVESTIGATION.md Entry 22.)
+        # reuse the seeded initial state each epoch (carrying x forward measured
+        # worse on the S4.8 check: 7/30 ok vs 5/30)
         x0_epoch = np.ascontiguousarray(x0, dtype=np.float64).copy()
         x_hat, theta_hat, y_hat, Pkf_final, Prls_final, innov_final, S_final = _dual_estimator_core(
             u, y, phi_ar, Q_diag, float(R), x0_epoch, P0_kf_c.copy(), theta_cur, P0_rls_c.copy(),
@@ -897,26 +746,16 @@ def run_dual_estimator(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, Q_diag:
 
 
 def nis_consistency_check(innov: np.ndarray, S: np.ndarray) -> tuple[np.ndarray, float, bool]:
-    """NIS_k = innov_k^2/S_k ~ chi2(1) if Q/R are correctly scaled (Bar-Shalom,
-    Li & Kirubarajan, Estimation with Applications to Tracking and Navigation,
-    sec 5.4); mean should be ~1. Systematically >1 means Q/R too small (filter
-    overconfident); systematically <1 means Q/R too large (filter
-    underconfident). Consistency band on the sample mean via the CLT
-    (var(chi2(1))=2), reusing the existing WHITENESS_CI z-score rather than
-    pulling in scipy.stats for one critical value."""
     nis = innov ** 2 / S
     band = WHITENESS_CI * np.sqrt(2.0 / len(nis))
     mean_nis = float(np.mean(nis))
     return nis, mean_nis, bool(abs(mean_nis - 1.0) <= band)
 
 
-# ==========================================================================
-# 5. Verification suite (math/estimator self-checks, independent of data)
-# ==========================================================================
+# Verification suite
 
 def rls_step_dense(theta: np.ndarray, P: np.ndarray, phi_vec: np.ndarray,
                     target: float, lam: float) -> tuple[np.ndarray, np.ndarray]:
-    """Textbook (dense, no numba) RLS step -- spec eqs. 43-45."""
     Pphi = P @ phi_vec
     denom = lam + phi_vec @ Pphi
     K = Pphi / denom
@@ -928,8 +767,6 @@ def rls_step_dense(theta: np.ndarray, P: np.ndarray, phi_vec: np.ndarray,
 
 def riv_step_dense(theta: np.ndarray, P: np.ndarray, phi_vec: np.ndarray, z_vec: np.ndarray,
                     target: float, lam: float) -> tuple[np.ndarray, np.ndarray]:
-    """Dense recursive instrumental-variable (RIV) step -- the same
-    Soderstrom & Stoica recursion as the jitted core's parameter update."""
     Pz = P @ z_vec
     denom = lam + phi_vec @ Pz
     K = Pz / denom
@@ -940,8 +777,6 @@ def riv_step_dense(theta: np.ndarray, P: np.ndarray, phi_vec: np.ndarray, z_vec:
 
 
 def test_rls_matches_batch_ls(rng: np.random.Generator) -> None:
-    """S4.2: on a fixed (Phi, y), RLS with lambda=1 and a large P0 must
-    reproduce the batch normal-equations solution theta=(Phi^T Phi)^-1 Phi^T y."""
     N, m = 500, 4
     Phi = rng.normal(size=(N, m))
     theta_star = rng.normal(size=m)
@@ -959,16 +794,13 @@ def test_rls_matches_batch_ls(rng: np.random.Generator) -> None:
 
 
 def test_structured_kf_prop_matches_dense(rng: np.random.Generator) -> None:
-    """S4.3: structured P- = A P A^T + Q (the exact function used inside the
-    jitted core) must match an explicitly-built dense blkdiag(A_eta,A_beta)
-    @ P @ A.T + diag(Q)."""
     n_eta, p = N_ETA, 7
     n = n_eta + p
 
     a1, a2 = rng.uniform(-1, 1, size=2)
     phi_ar = rng.normal(scale=0.3, size=p)
     M = rng.normal(size=(n, n))
-    P = M @ M.T  # random symmetric PSD
+    P = M @ M.T
     Q_diag = rng.uniform(1e-6, 1e-2, size=n)
 
     A_eta = np.array([[a1, 1.0], [a2, 0.0]])
@@ -998,22 +830,6 @@ def reference_dual_estimator_dense(u: np.ndarray, y: np.ndarray, phi_ar: np.ndar
                                     instrument: str = "aux_model"
                                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
                                                np.ndarray, np.ndarray]:
-    """S4.4: independent, readable, dense-matmul dual estimator (plain KF
-    predict/update + textbook RIV), no numba, no structured tricks -- used
-    to validate the jitted core's arithmetic, and (via `instrument`) to
-    compare RIV instrument choices without touching the validated jitted
-    production core. n_off appends an optional identity-dynamics offset
-    state (H picks it up with +1).
-
-    instrument="aux_model" (default, matches the jitted core): z_k=[eta_aux_{k-1},
-    eta_aux_{k-2},u_{k-1},u_{k-2}], eta_aux a noise-free auxiliary simulation
-    driven by u (Soderstrom & Stoica IV) -- uncorrelated with the colored
-    disturbance leaking into eta_hat.
-    instrument="lagged_u": z_k=[u_{k-3},u_{k-4},u_{k-1},u_{k-2}], the classic
-    delayed-input instrument -- simpler, valid whenever u is persistently
-    exciting and uncorrelated with the disturbance beyond the ARX lag
-    structure, but ignores the plant-dynamics information the aux-model
-    instrument exploits."""
     if instrument not in ("aux_model", "lagged_u"):
         raise ValueError(f"unknown instrument: {instrument!r}")
     idx_beta = n_eta
@@ -1083,7 +899,7 @@ def reference_dual_estimator_dense(u: np.ndarray, y: np.ndarray, phi_ar: np.ndar
             z_vec = np.array([z1, z2, u_km1, u_km2])
             z_new = theta[0] * z1 + theta[1] * z2 + theta[2] * u_km1 + theta[3] * u_km2
             z2, z1 = z1, z_new
-        else:  # "lagged_u"
+        else:
             u_km3 = u[kk - 3] if kk - 3 >= 0 else 0.0
             u_km4 = u[kk - 4] if kk - 4 >= 0 else 0.0
             z_vec = np.array([u_km3, u_km4, u_km1, u_km2])
@@ -1126,8 +942,7 @@ def test_jit_core_matches_dense_reference_and_covariance_sanity(rng: np.random.G
     cov_stride = 1
     n_checks = N // cov_stride + 1
 
-    # Verify the jitted core matches the dense reference for BOTH the plain model
-    # (n_off=0) and the offset-augmented model (n_off=1, the real-data fix).
+    # jitted core vs dense reference, with and without the offset state
     for n_off in (0, 1):
         n = n_eta + p + n_off
         Q_diag = np.concatenate((np.full(n_eta, 0.1), np.full(p, 0.1)))
@@ -1138,8 +953,7 @@ def test_jit_core_matches_dense_reference_and_covariance_sanity(rng: np.random.G
         P0_kf = 10.0 * np.eye(n)
         Pkf_checks = np.zeros((n_checks, n, n))
         Prls_checks = np.zeros((n_checks, 4, 4))
-        # gamma_pole=0.05 on the second pass also exercises the pole-regularised
-        # path; the jitted core and dense reference must still agree.
+        # gamma_pole=0.05 on the second pass also exercises the pole-regularised path
         gp = 0.0 if n_off == 0 else 0.05
         x_hat_fast, theta_hat_fast, y_hat_fast, Pkf_final, Prls_final, innov_fast, S_fast = _dual_estimator_core(
             u, y, phi_ar, Q_diag, 1e-4, x0, P0_kf, theta0, P0_rls, lam, n_eta, p, n_off,
@@ -1176,8 +990,7 @@ def test_jit_core_matches_dense_reference_and_covariance_sanity(rng: np.random.G
 
 
 def test_theta_to_params_is_inverse(cfg: Config) -> None:
-    """S4.7: theta_to_params must invert params_to_theta to numerical
-    precision, for an arbitrary test plant (no real ground truth exists)."""
+    """S4.7: theta_to_params must invert params_to_theta to numerical precision."""
     k_test, tau1_test, tau2_test = 60.0, 0.05, 0.25
     theta_test = params_to_theta(k_test, tau1_test, tau2_test, cfg.Ts)
     k, tau1, tau2 = theta_to_params(theta_test, cfg.Ts)
@@ -1196,24 +1009,6 @@ def test_theta_to_params_is_inverse(cfg: Config) -> None:
 
 
 def test_v1_recovers_synthetic_plant(cfg: Config, dual_cfg: DualConfig) -> None:
-    """S4.8: does the full V1 pipeline (heuristic R/q_eta + epoch KF+RIV loop)
-    recover a KNOWN synthetic plant? No such ground-truth recovery test
-    existed in this repo before -- only math self-consistency tests
-    (S4.1-4.7) and separate, non-persisted scratchpad scripts.
-
-    A maximum-likelihood/MAP replacement for the R/q_eta heuristic was
-    investigated in depth here and found ill-posed for V1's architecture
-    (calibrate_noise_mle, kept below as documented negative-result evidence,
-    not used in production -- see INVESTIGATION.md). This test instead
-    honestly characterizes what the ACTUAL production pipeline (heuristic
-    noise) achieves: measured over a fixed set of synthetic seeds (IID
-    uniform u, known AR(3) disturbance), only ~23% (7/30 tested) recover
-    k within 30% of truth with the correct sign -- V1's epoch KF+RIV
-    attractor (Entry 9) makes recovery seed-dependent, not reliable. A
-    single-seed pass/fail assertion would misrepresent that reliability
-    either way, so this asserts the pipeline runs cleanly (no crash/NaN)
-    and that AT LEAST ONE seed in the fixed set recovers reasonably (a
-    floor that catches genuine regressions, not a reliability claim)."""
     k_true, tau1_true, tau2_true, c0_true = 80.0, 0.05, 0.25, 1.10
     phi_ar_true = np.array([0.6, -0.2, 0.1])
     sigma2_true = 0.05
@@ -1248,7 +1043,7 @@ def test_v1_recovers_synthetic_plant(cfg: Config, dual_cfg: DualConfig) -> None:
     assert n_ok > 0, f"0/{len(seeds)} seeds recovered k within 30% of truth -- pipeline regression"
     print(f"[4.8] V1 pipeline runs cleanly on synthetic data across {len(seeds)} seeds; "
           f"{n_ok}/{len(seeds)} recovered k within 30% of truth (attractor-limited, "
-          f"see INVESTIGATION.md -- not a reliability guarantee).")
+          f"not a reliability guarantee).")
 
 
 def run_verification_suite(cfg: Config) -> None:
@@ -1261,9 +1056,7 @@ def run_verification_suite(cfg: Config) -> None:
     test_v1_recovers_synthetic_plant(cfg, DUAL_CFG)
 
 
-# ==========================================================================
-# 6. Reporting / plotting
-# ==========================================================================
+# Reporting / plotting
 
 def plot_input(t: np.ndarray, u: np.ndarray, path: Path,
                 title: str = "Real stimulation input") -> None:
@@ -1282,24 +1075,14 @@ def plot_output_fit(t: np.ndarray, y: np.ndarray, y_hat: np.ndarray, path: Path,
     fig.tight_layout(); fig.savefig(path); plt.close(fig)
 
 
-def plot_residual(t: np.ndarray, resid: np.ndarray, path: Path,
-                   ylabel: str = "residual", title: str = "Residual vs time") -> None:
-    fig, ax = plt.subplots(figsize=(9, 3))
-    ax.axhline(0, color="k", lw=0.5)
-    ax.plot(t, resid, lw=1)
-    ax.set_xlabel("time (s)"); ax.set_ylabel(ylabel); ax.set_title(title)
-    fig.tight_layout(); fig.savefig(path); plt.close(fig)
-
-
 def plot_input_excitation(u: np.ndarray, Ts: float, tau1_fit: float, tau2_fit: float,
                            tau1_ref: float, tau2_ref: float, path: Path) -> None:
-    """Two-panel diagnostic: PSD of u vs plant pole corner frequencies, and autocorrelation
-    of u vs plant impulse-response decay -- shows whether u has enough fast content to
-    separately excite both lags (poor separation is why a1,a2 -- and hence
-    k=(b1+b2)/(1-a1-a2) -- can drift toward the near-zero-denominator corner). Both this
-    recording's own final fit (tau*_fit, can itself be corrupted if the fit diverged) and
-    the fixed avg-patient prior (tau*_ref, AVG_PATIENT_PARAMS -- independent of any fit) are
-    marked, since the fit-based corner is circular evidence on a diverged recording."""
+    """Two panels: PSD of u vs plant pole corner frequencies, and autocorrelation
+    of u vs impulse-response decay. They show whether u has enough fast content
+    to excite both lags separately (poor separation lets a1,a2, and hence
+    k=(b1+b2)/(1-a1-a2), drift toward the near-zero-denominator corner).
+    Corners are marked for the recording's own fit (tau*_fit, unreliable if the
+    fit diverged) and for the fixed AVG_PATIENT_PARAMS prior (tau*_ref)."""
     n = len(u)
     freqs = np.fft.rfftfreq(n, d=Ts)
     U = np.fft.rfft(u - u.mean())
@@ -1355,7 +1138,7 @@ def plot_theta_trajectory(t: np.ndarray, theta_hat: np.ndarray, path: Path) -> N
 
 def plot_k_tau_vs_epoch(epochs: np.ndarray, k_arr: list[float], tau1_arr: list[float],
                          tau2_arr: list[float], path: Path) -> None:
-    """The final (k, tau1, tau2) recovered at the end of every epoch."""
+    """Final (k, tau1, tau2) at the end of every epoch."""
     fig, axes = plt.subplots(3, 1, figsize=(7, 7), sharex=True)
     axes[0].plot(epochs, k_arr, marker="o", ms=3, lw=1, color="tab:blue")
     axes[0].set_ylabel("k")
@@ -1369,9 +1152,8 @@ def plot_k_tau_vs_epoch(epochs: np.ndarray, k_arr: list[float], tau1_arr: list[f
 
 def epoch_convergence_check(k_arr: list[float], tau1_arr: list[float], tau2_arr: list[float],
                              rtol: float) -> tuple[float, float, float, bool]:
-    """Relative change in (k, tau1, tau2) between the last two epochs --
-    numeric companion to plot_k_tau_vs_epoch. Undefined (nan, not converged)
-    with fewer than 2 epochs -- there's no epoch-to-epoch change to measure."""
+    """Relative change in (k, tau1, tau2) between the last two epochs; nan (not
+    converged) with fewer than 2 epochs."""
     if len(k_arr) < 2:
         return float("nan"), float("nan"), float("nan"), False
     def rel(a: list[float]) -> float:
@@ -1415,19 +1197,14 @@ def plot_theta_epochs_stacked(t: np.ndarray, epochs: list[int],
 
 def plot_final_params_bar(results: dict[str, dict], path: Path,
                            include_reference: bool = False) -> None:
-    """Final (k, tau1, tau2) per recording, one bar-chart panel each, side
-    by side on the same figure. Recordings whose |k| is wildly off the rest
-    (the estimator failed to settle within its epoch budget) are dropped
-    so one runaway fit doesn't crush the axis for everyone else.
-    If include_reference, an extra "avg patient" bar (literature/prior
-    values, not fit from this data) is appended in a distinct color."""
+    """Final (k, tau1, tau2) per recording, one bar panel each. Recordings with
+    |k| far off the rest (failed to settle) are dropped so one runaway fit does
+    not crush the axis. include_reference appends an "avg patient" bar (prior
+    values, not fit)."""
     all_names = list(results)
     k_all = np.array([results[name]["k"] for name in all_names])
     median_abs_k = float(np.median(np.abs(k_all))) or 1.0
-    # ponytail: 20x the median |k| is a blunt divergence check, not a
-    # statistical test -- flags an estimator that clearly never settled,
-    # not genuine outliers; raise/lower if recordings legitimately vary
-    # in gain by more than that.
+    # blunt divergence check (20x median |k|), not a statistical test
     keep = np.abs(k_all) <= 20.0 * median_abs_k
     dropped = [n for n, k in zip(all_names, keep) if not k]
     if dropped:
@@ -1456,26 +1233,10 @@ def plot_final_params_bar(results: dict[str, dict], path: Path,
     fig.tight_layout(); fig.savefig(path); plt.close(fig)
 
 
-# ==========================================================================
-# 7. Main
-# ==========================================================================
+# Main
 
 def build_kf_setup(u: np.ndarray, y: np.ndarray, phi_coeffs: np.ndarray, sigma2_ar: float,
                     q_eta: float, cfg: Config, dual_cfg: DualConfig) -> dict:
-    """Shared KF/RIV initial-condition setup (u-normalization, average-patient
-    theta0 prior, Q_diag, x0, P0) -- reused by run_identification and any
-    diagnostic harness (e.g. instrument-choice comparison) that needs the
-    same starting point without duplicating this logic.
-
-    n_off=1: appends a constant/slow-drift offset state so the beta DC
-    baseline is no longer forced into the stim-response eta (root-cause fix
-    for the real-data negative-k failure -- see PHASE4_ROOT_CAUSE_ANALYSIS.md).
-
-    ponytail: the real input only spans ~0.004-0.026 while eta/beta sit at
-    O(1) -- fitting b1,b2 directly against that made the ARX regression
-    badly conditioned (verified empirically: RLS covariance would blow up
-    in the u-driven direction). Normalize by std(u) for the estimator and
-    undo it only when reading back the physical (k,tau1,tau2)."""
     p = len(phi_coeffs)
     n_off = 1
     idx_off = N_ETA + p
@@ -1484,8 +1245,6 @@ def build_kf_setup(u: np.ndarray, y: np.ndarray, phi_coeffs: np.ndarray, sigma2_
     u_scale = float(np.std(u))
     u_norm = u / u_scale
 
-    # Initial theta: the average-patient reference plant (not fit from this
-    # recording) -- the RIV update is the only estimator, no batch LS warm start.
     theta0 = params_to_theta(AVG_PATIENT_PARAMS["k"], AVG_PATIENT_PARAMS["tau1"],
                               AVG_PATIENT_PARAMS["tau2"], cfg.Ts)
     theta0[2] *= u_scale
@@ -1495,7 +1254,7 @@ def build_kf_setup(u: np.ndarray, y: np.ndarray, phi_coeffs: np.ndarray, sigma2_
     Q_diag = np.concatenate((build_process_noise_diag(N_ETA, p, q_eta, sigma2_ar, 0.1 * sigma2_ar),
                              [q_off]))
     x0 = np.zeros(n)
-    x0[idx_off] = float(np.mean(y))          # seed the offset at the beta baseline
+    x0[idx_off] = float(np.mean(y))
     P0_kf = dual_cfg.p0_kf_state_var * np.eye(n)
     P0_rls = dual_cfg.p0_rls * np.eye(4)
     phi_c = np.ascontiguousarray(phi_coeffs, dtype=np.float64)
@@ -1511,181 +1270,8 @@ def theta_to_params_physical(theta: np.ndarray, u_scale: float, Ts: float) -> tu
     k, tau1, tau2 = theta_to_params_safe(theta, Ts)
     return k / u_scale, tau1, tau2
 
-
-# ==========================================================================
-# Experimental / negative-result code, NOT used by main() -- kept as
-# reproducible evidence for INVESTIGATION.md's noise-calibration entry.
-# Decoupled (fixed-plant) MLE/MAP calibration of R and q_eta was tried and
-# found ill-posed for V1's architecture: beta's own AR process can absorb
-# almost any residual regardless of whether the fixed plant is right, so the
-# likelihood keeps improving as q_eta->0 at every anchor point and every MAP
-# prior width tested. main() still uses the R=0.05x/q_eta=0.5x heuristic.
-# ==========================================================================
-
-def _v1_forward_kf_nll(params: np.ndarray, u_norm: np.ndarray, y: np.ndarray,
-                        phi_ar: np.ndarray, sigma2_ar: float, n_eta: int, p: int,
-                        theta_fixed: np.ndarray, x0: np.ndarray, P0_kf: np.ndarray,
-                        q_off: float, return_traj: bool = False
-                        ) -> tuple[float, np.ndarray | None, np.ndarray | None]:
-    """Single forward KF predict/update pass (no RIV -- the plant `theta_fixed`
-    is held at the avg-patient prior) used to calibrate R and q_eta by maximum
-    likelihood instead of the old 0.05x/0.5x heuristic multipliers. Same state
-    layout as `_dual_estimator_core` (n_off=1 offset state); params=[log_R,
-    log_q_eta]."""
-    log_R, log_q_eta = params
-    R = float(np.exp(log_R))
-    q_eta = float(np.exp(log_q_eta))
-    idx_beta = n_eta
-    idx_off = n_eta + p
-    n = n_eta + p + 1
-
-    process_noise_diag = np.concatenate((
-        build_process_noise_diag(n_eta, p, q_eta, sigma2_ar, 0.1 * sigma2_ar),
-        [q_off],
-    ))
-    Q = np.diag(process_noise_diag)
-
-    a1, a2, b1, b2 = theta_fixed
-    A = np.zeros((n, n))
-    A[0, 0], A[0, 1] = a1, 1.0
-    A[1, 0] = a2
-    A[idx_beta, idx_beta:idx_beta + p] = phi_ar
-    if p > 1:
-        A[idx_beta + 1:idx_beta + p, idx_beta:idx_beta + p - 1] = np.eye(p - 1)
-    A[idx_off, idx_off] = 1.0
-
-    B = np.zeros(n)
-    B[0], B[1] = b1, b2
-
-    H = np.zeros(n)
-    H[0] = -1.0
-    H[idx_beta] = 1.0
-    H[idx_off] = 1.0
-
-    x = x0.copy().astype(float)
-    P = P0_kf.copy().astype(float)
-    n_samples = len(y)
-    nll = 0.0
-    innov = np.zeros(n_samples) if return_traj else None
-    S_traj = np.zeros(n_samples) if return_traj else None
-
-    for sample in range(n_samples):
-        if sample > 0:
-            x = A @ x + B * u_norm[sample - 1]
-            P = A @ P @ A.T + Q
-            P = 0.5 * (P + P.T)
-
-        innovation = y[sample] - float(H @ x)
-        innov_cov = float(H @ P @ H + R)
-        if innov_cov <= 0 or not np.isfinite(innov_cov):
-            return 1e18, innov, S_traj
-
-        nll += 0.5 * (innovation * innovation / innov_cov + np.log(2 * np.pi * innov_cov))
-        kalman_gain = (P @ H) / innov_cov
-        x = x + kalman_gain * innovation
-        P = P - np.outer(kalman_gain, H @ P)
-        P = 0.5 * (P + P.T)
-
-        if return_traj:
-            innov[sample] = innovation
-            S_traj[sample] = innov_cov
-
-    return nll, innov, S_traj
-
-
-# ponytail: unvalidated width for the log-normal MAP prior on (R,q_eta) in
-# calibrate_noise_mle -- log(10) puts "10x off the old heuristic" at 1 std,
-# matching the plausible range the heuristic's own tuning comment considered
-# ({0.5,1,10}x var(y)). Wide enough to let data move the estimate, narrow
-# enough to block the R,q_eta->0 degenerate collapse (verified empirically:
-# an unregularized fixed-theta MLE collapses to the numerical floor on every
-# synthetic seed AND every real recording tested -- see INVESTIGATION.md).
-NOISE_PRIOR_LOG_STD = np.log(10.0)
-
-
-def calibrate_noise_mle(u: np.ndarray, y: np.ndarray, phi_coeffs: np.ndarray, sigma2_ar: float,
-                         cfg: Config, dual_cfg: DualConfig, out_dir: Path) -> dict:
-    """Replace the old R=0.05*sigma2_ar / q_eta=0.5*var(y) heuristics (picked
-    to make epoch-to-epoch (k,tau1,tau2) settle visually, never checked
-    against actual innovation statistics -- see RESEARCH_NOTEBOOK.md A6) with
-    a maximum-a-posteriori calibration of R and q_eta.
-
-    Plain (unregularized) fixed-theta MLE is ill-posed here, not just badly
-    anchored: with theta held fixed at ANY point (raw avg-patient prior, or a
-    warm-started converged theta -- both tried), beta's own AR process plus
-    the offset state have enough flexibility to absorb almost any residual
-    regardless of whether the fixed eta prediction is any good, so the
-    likelihood keeps "improving" as R,q_eta->0 -- a numerically degenerate
-    near-interpolating filter, not a meaningful noise estimate. Verified on
-    every synthetic seed and every real recording tested (see
-    INVESTIGATION.md). A weak log-normal MAP prior centered on the old
-    heuristic (NOISE_PRIOR_LOG_STD) blocks the collapse while still letting
-    data pull the estimate away from the heuristic.
-
-    Two stages:
-    1. Warm-start: one full run_identification pass with the OLD heuristic
-       noise, to get theta off the (likely wrong) avg-patient prior before
-       calibrating against it.
-    2. MAP-calibrate R, q_eta with theta fixed at that warm-started anchor
-       (still one calibration pass, not recoupled into the epoch loop)."""
-    y_var = float(np.var(y))
-    warm = run_identification(
-        u, y, phi_coeffs, sigma2_ar, 0.05 * sigma2_ar, 0.5 * y_var,
-        cfg, dual_cfg, out_dir, make_plots=False,
-    )
-    theta_anchor = warm["theta_final"]
-
-    setup = build_kf_setup(u, y, phi_coeffs, sigma2_ar, 0.5 * y_var, cfg, dual_cfg)
-    u_norm = setup["u_norm"]
-    x0, P0_kf, p = setup["x0"], setup["P0_kf"], setup["p"]
-    q_off = dual_cfg.q_off_frac * y_var
-
-    R0 = 0.05 * sigma2_ar
-    q_eta0 = 0.5 * y_var
-    log_R0, log_q_eta0 = np.log(R0), np.log(q_eta0)
-    p0 = np.array([log_R0, log_q_eta0])
-    bounds = [
-        (np.log(1e-8 * sigma2_ar), np.log(1e6 * sigma2_ar)),
-        (np.log(1e-10), np.log(1e6 * y_var)),
-    ]
-
-    def objective(params):
-        nll, _, _ = _v1_forward_kf_nll(
-            params, u_norm, y, phi_coeffs, sigma2_ar, N_ETA, p, theta_anchor, x0, P0_kf, q_off,
-        )
-        log_prior = (
-            0.5 * ((params[0] - log_R0) / NOISE_PRIOR_LOG_STD) ** 2
-            + 0.5 * ((params[1] - log_q_eta0) / NOISE_PRIOR_LOG_STD) ** 2
-        )
-        return nll + log_prior
-
-    sol = minimize(
-        objective, p0,
-        method="L-BFGS-B", bounds=bounds,
-        options={"maxiter": 300, "ftol": 1e-10},
-    )
-    R_cal = float(np.exp(sol.x[0]))
-    q_eta_cal = float(np.exp(sol.x[1]))
-
-    _, innov, S_traj = _v1_forward_kf_nll(
-        sol.x, u_norm, y, phi_coeffs, sigma2_ar, N_ETA, p,
-        theta_anchor, x0, P0_kf, q_off, return_traj=True,
-    )
-    _, nis_mean, nis_ok = nis_consistency_check(innov, S_traj)
-    white_pass, white_frac = residual_whiteness_test(innov)
-
-    return {
-        "R": R_cal, "q_eta": q_eta_cal, "success": bool(sol.success),
-        "nis_mean": nis_mean, "nis_consistent": nis_ok,
-        "whiteness_pass": white_pass, "whiteness_frac_exceed": white_frac,
-        "R_heuristic": R0, "q_eta_heuristic": q_eta0,
-    }
-
-
 def _warm_up_jit_core(u_norm, y, phi_c, Q_c, R, x0, P0_kf, theta0, P0_rls,
                        dual_cfg, n_off, p, a1_prior, a2_prior, n):
-    """Trigger numba compilation on a 5-sample slice before timing the real
-    run, so the one-time JIT compile cost isn't charged to the estimate."""
     _dual_estimator_core(
         u_norm[:5], y[:5], phi_c, Q_c, R, x0.copy(), P0_kf.copy(),
         theta0, P0_rls.copy(), dual_cfg.lambda_ff, N_ETA, p, n_off,
@@ -1696,16 +1282,7 @@ def _warm_up_jit_core(u_norm, y, phi_c, Q_c, R, x0, P0_kf, theta0, P0_rls,
 
 def _compute_fit_diagnostics(theta_epoch_hist, Pkf_final, Prls_final, Pkf_checks,
                               innov_final, S_final, u_scale, cfg, dual_cfg):
-    """Post-fit health checks: covariance conditioning, innovation whiteness,
-    NIS calibration, epoch-to-epoch convergence, and covariance-trace plateau."""
     min_eig_kf = float(np.linalg.eigvalsh(0.5 * (Pkf_final + Pkf_final.T)).min())
-
-    # RLS covariance conditioning: a large/uncollapsed a1,a2 sub-block means the
-    # recursion genuinely never pinned those two directions down (weak excitation/
-    # observability); a small, well-conditioned block that still lands theta at the
-    # pole clamp corner instead means the recursion is confidently wrong (bias/attractor
-    # in the dual KF+RIV loop itself, not an excitation problem) -- see the negative-k
-    # investigation this diagnostic was added for.
     Prls_sym = 0.5 * (Prls_final + Prls_final.T)
     eig_a1a2 = np.linalg.eigvalsh(Prls_sym[:2, :2])
     cond_a1a2 = float(eig_a1a2.max() / eig_a1a2.min())
@@ -1759,7 +1336,6 @@ def run_identification(u: np.ndarray, y: np.ndarray, phi_coeffs: np.ndarray, sig
         dual_cfg, n_off, p, a1_prior, a2_prior, n,
     )
 
-    # First 4 epochs + the final one, to plot individually.
     selected_epochs = sorted(set(range(min(4, dual_cfg.n_epochs))) | {dual_cfg.n_epochs - 1})
 
     x_hat, theta_hat, y_hat, Pkf_final, Prls_final, Pkf_checks, _, theta_epoch_hist, \
@@ -1835,28 +1411,11 @@ def main() -> None:
     print(f"\nLoading real recordings from {cfg.data_dir / cfg.delay_dir} ...")
     recordings = load_all_recordings(cfg)
     print(f"loaded {len(recordings)} recordings: {list(recordings)}")
-
-    print("\nFitting beta AR disturbance model pooled across every recording's "
-          "no-stimulation periods (one consensus AR model shared by all recordings)...")
     ar_order, phi_coeffs, sigma2_ar = fit_ar_beta_model_pooled(recordings, cfg)
-
-    # ponytail: no repeated-trials data to separately identify sensor noise
-    # from process noise, so R and q_eta are set as data-scaled fractions of
-    # the AR innovation variance / pooled real output variance. A maximum-
-    # likelihood alternative to this heuristic was investigated in depth
-    # (calibrate_noise_mle, kept below as documented negative-result
-    # evidence, not wired in here) and found ill-posed for this architecture:
-    # with the plant held fixed, beta's own AR process can absorb almost any
-    # residual, so the likelihood keeps improving as q_eta->0 regardless of
-    # anchor point or MAP regularization strength -- see INVESTIGATION.md.
-    # R and the AR model are now both pooled (single value shared across
-    # recordings, not per-recording); q_eta stays a single global heuristic
-    # (0.5x pooled var(y)).
     R = 0.05 * sigma2_ar
     y_all_system_id = np.concatenate([recordings[f][1] for f in cfg.system_id_files])
     q_eta = 0.5 * float(np.var(y_all_system_id))
     print(f"pooled AR({ar_order}) sigma2_ar={sigma2_ar:.4e}, R={R:.4e}")
-    print(f"data-driven q_eta={q_eta:.4e} (heuristic; see comment above -- MLE calibration ruled out)")
 
     results = {}
     for name in cfg.system_id_files:

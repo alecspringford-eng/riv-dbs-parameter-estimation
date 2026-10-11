@@ -1,17 +1,14 @@
-"""riv_single_pole_semisynth_check.py -- Phase 1 semi-synthetic validation
-gate for the single-pole (k, tau) RIV re-parameterization
+"""Semi-synthetic validation gate for the single-pole (k, tau) RIV estimator
 (riv_single_pole_estimation.py).
 
-Known-truth plant driven by a wide persistently-exciting multisine (per the
-tutor's suggested method), same AR(3) beta-disturbance truth as the existing
-two-pole synthetic check (riv_mpc_param_export.py's generate_synthetic_iv),
-Monte Carlo over both seed and a (k, tau) grid. This is the explicit
-go/no-go before touching real data: only run
-riv_single_pole_real_data_check.py if this recovers truth reliably.
+A known-truth plant is driven by a wide persistently exciting multisine, with
+the same AR(3) beta-disturbance truth as the two-pole synthetic check
+(riv_mpc_param_export.py's generate_synthetic_iv), Monte Carlo over seed and a
+(k, tau) grid. This is the go/no-go before touching real data: run
+riv_single_pole_real_data_check.py only if truth is recovered reliably.
 
-Does not modify riv_dual_estimation.py, riv_single_pole_estimation.py, or
-riv_excitation_protocol_design_check.py -- reuses their existing public
-functions only.
+Reuses public functions of riv_dual_estimation.py, riv_single_pole_estimation.py
+and riv_excitation_protocol_design_check.py without modifying them.
 """
 from __future__ import annotations
 
@@ -23,12 +20,10 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "estimators/v1"))
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "experiments/excitation_design"))
-_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "experiments/v1_logparam"))
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "estimators/mpc_export"))
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "estimators/single_pole"))
-from riv_dual_estimation import CFG, DUAL_CFG, ar_to_state_space
+from riv_dual_estimation import CFG, DUAL_CFG, ar_to_state_space, pe_order_check
 from riv_excitation_protocol_design_check import make_multisine
-from riv_v1_logparam_diagnostics import pe_order_check
 from riv_mpc_param_export import PHI_AR_TRUE, SIGMA2_TRUE, C0_TRUE
 from riv_single_pole_estimation import (
     N_ETA_1P, AVG_PATIENT_PARAMS_1P,
@@ -39,12 +34,11 @@ from riv_single_pole_estimation import (
 N_SYNTH = 3000
 N_SEEDS = 30
 OUT_DIR = Path(__file__).resolve().parent.parent.parent.parent / "results" / "single_pole_semisynth"
-U_LO, U_HI = 0.004, 0.026  # matches real u's amplitude range (generate_synthetic_iv)
-# Wide, log-spaced tones from well below the dominant lag's bandwidth to
-# near-Nyquist (Ts=0.04s -> 12.5 Hz) -- "wide persistently exciting
-# multisine" per the tutor's suggested method.
+U_LO, U_HI = 0.004, 0.026  # real u's amplitude range
+# Wide, log-spaced tones from well below the dominant lag's bandwidth to near-Nyquist
+# (Ts=0.04s -> 12.5 Hz)
 MULTISINE_FREQS_HZ = list(np.geomspace(0.1, 10.0, 10))
-OK_REL_TOL = 0.3  # matches this repo's existing ok-threshold convention (run_theta_arm)
+OK_REL_TOL = 0.3  # as in run_theta_arm
 
 
 def make_wide_multisine(N: int, rng: np.random.Generator) -> np.ndarray:
@@ -53,9 +47,9 @@ def make_wide_multisine(N: int, rng: np.random.Generator) -> np.ndarray:
 
 def generate_synthetic_iv_1p(seed: int, k_true: float, tau_true: float,
                               N: int = N_SYNTH) -> tuple[np.ndarray, np.ndarray]:
-    """Known-truth synthetic (u, y): wide multisine u, ARX(1)-simulated eta
-    from the truth plant, same AR(3) beta random-walk disturbance truth as
-    riv_mpc_param_export.generate_synthetic_iv (PHI_AR_TRUE/SIGMA2_TRUE/C0_TRUE)."""
+    """Known-truth (u, y): wide multisine u, ARX(1)-simulated eta, and the AR(3)
+    beta disturbance of riv_mpc_param_export.generate_synthetic_iv
+    (PHI_AR_TRUE/SIGMA2_TRUE/C0_TRUE)."""
     rng = np.random.default_rng(seed)
     u = make_wide_multisine(N, rng)
     eta_true = simulate_arx_recursion_1p(params_to_theta_1p(k_true, tau_true, CFG.Ts), u)
@@ -74,16 +68,12 @@ def generate_synthetic_iv_1p(seed: int, k_true: float, tau_true: float,
 def run_1p_arm(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, sigma2_ar: float,
                 q_eta: float, cfg, dual_cfg, k_true: float, tau_true: float,
                 n_epochs_online: int = 1, r_mult: float = 0.05) -> dict:
-    """Runs the single-pole dual estimator two ways on the same (u, y): a
-    full-convergence pass (dual_cfg.n_epochs epochs) for the final estimate,
-    and a single causal pass for the per-sample online trajectory. Warm
-    start stays at the default AVG_PATIENT_PARAMS_1P prior regardless of
-    (k_true, tau_true) -- exactly as build_kf_setup_1p would use on real
-    data with unknown truth, so this also tests recovery under prior
-    mismatch, not just local convergence near the truth. r_mult exposes the
-    R=0.05*sigma2_ar heuristic multiplier for noise-calibration sweeps
-    (riv_single_pole_noise_calibration.py) -- 0.05 matches this repo's
-    existing theta-arm convention (run_theta_arm)."""
+    """Run the single-pole dual estimator on (u, y): a full-convergence pass
+    (dual_cfg.n_epochs) for the final estimate and a single causal pass for the
+    online trajectory. The warm start stays at the AVG_PATIENT_PARAMS_1P prior
+    regardless of truth, as on real data, so recovery under prior mismatch is
+    tested too. r_mult is the R=0.05*sigma2_ar multiplier for the noise
+    calibration sweeps (0.05 matches run_theta_arm)."""
     R = r_mult * sigma2_ar
 
     setup = build_kf_setup_1p(u, y, phi_ar, sigma2_ar, q_eta, cfg, dual_cfg)
@@ -116,10 +106,8 @@ def run_1p_arm(u: np.ndarray, y: np.ndarray, phi_ar: np.ndarray, sigma2_ar: floa
 
 
 def check_excitation_pe_order() -> None:
-    """Direct test of the structural hypothesis: the 1-pole regressor
-    [eta_{k-1}, u_{k-1}] only needs PE order 2 (vs. the 2-pole model's order
-    4), so even a modest multisine should be persistently exciting to the
-    order this model actually needs."""
+    """The 1-pole regressor [eta_{k-1}, u_{k-1}] needs only PE order 2 (the
+    2-pole model needs 4), so even a modest multisine should suffice."""
     rng = np.random.default_rng(CFG.seed)
     u = make_wide_multisine(N_SYNTH, rng)
     pe2 = pe_order_check(u, 2)
@@ -135,7 +123,7 @@ def export_semisynth(n_seeds: int = N_SEEDS, N: int = N_SYNTH, out_dir: Path = O
     k_grid = [30.0, k_ref, 100.0]
     tau_ref = 0.15  # representative tau for the k-sweep
 
-    results = {}  # (label) -> dict of arrays
+    results = {}
 
     def run_grid(label: str, k_true: float, tau_true: float) -> None:
         k_f, tau_f, ok = [], [], []
@@ -151,11 +139,11 @@ def export_semisynth(n_seeds: int = N_SEEDS, N: int = N_SYNTH, out_dir: Path = O
                                k_final=np.array(k_f), tau_final=np.array(tau_f),
                                ok=np.array(ok), ok_rate=ok_rate)
 
-    print("--- tau sweep (k fixed at avg-patient reference) ---")
+    print("tau sweep (k fixed at avg-patient reference)")
     for tau_true in tau_grid:
         run_grid(f"tau={tau_true}", k_ref, tau_true)
 
-    print("--- k sweep (tau fixed at representative value) ---")
+    print("k sweep (tau fixed at representative value)")
     for k_true in k_grid:
         run_grid(f"k={k_true}", k_true, tau_ref)
 
